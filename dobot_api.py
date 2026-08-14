@@ -7,6 +7,14 @@ import os
 import json
 import time
 
+
+DOBOT_CONNECT_TIMEOUT_S = 3.0
+DOBOT_REPLY_TIMEOUT_S = {
+    29999: 8.0,
+    30003: 60.0,
+    30004: 3.0,
+}
+
 alarmControllerFile = "files/alarm_controller.json"
 alarmServoFile = "files/alarm_servo.json"
 
@@ -147,11 +155,16 @@ class DobotApi:
         if self.port == 29999 or self.port == 30003 or self.port == 30004:
             try:
                 self.socket_dobot = socket.socket()
+                self.socket_dobot.settimeout(DOBOT_CONNECT_TIMEOUT_S)
                 self.socket_dobot.connect((self.ip, self.port))
-            except socket.error:
-                print(socket.error)
-                raise Exception(
-                    f"Unable to set socket connection use port {self.port} !", socket.error)
+                self.socket_dobot.settimeout(DOBOT_REPLY_TIMEOUT_S[self.port])
+            except OSError as exc:
+                if self.socket_dobot != 0:
+                    self.socket_dobot.close()
+                    self.socket_dobot = 0
+                raise ConnectionError(
+                    f"Cannot connect to {self.ip}:{self.port}: {exc}"
+                ) from exc
         else:
             raise Exception(
                 f"Connect to dashboard server need use port {self.port} !")
@@ -166,26 +179,32 @@ class DobotApi:
     def send_data(self, string):
         self.log(f"Send to {self.ip}:{self.port}: {string}")
         try:
-            self.socket_dobot.send(str.encode(string, 'utf-8'))
-        except Exception as e:
-            print(e)
+            self.socket_dobot.sendall(str.encode(string, 'utf-8'))
+        except OSError as exc:
+            raise ConnectionError(
+                f"Send to {self.ip}:{self.port} failed: {exc}"
+            ) from exc
 
     def wait_reply(self):
         """
     Read the return value
     """
-        data = ""
         try:
             data = self.socket_dobot.recv(1024)
-        except Exception as e:
-            print(e)
-        finally:
-            if len(data) == 0:
-                data_str = data
-            else:
-                data_str = str(data, encoding="utf-8")
-            self.log(f'Receive from {self.ip}:{self.port}: {data_str}')
-            return data_str
+        except socket.timeout as exc:
+            raise TimeoutError(
+                f"Timed out waiting for {self.ip}:{self.port} reply"
+            ) from exc
+        except OSError as exc:
+            raise ConnectionError(
+                f"Receive from {self.ip}:{self.port} failed: {exc}"
+            ) from exc
+        if len(data) == 0:
+            data_str = data
+        else:
+            data_str = str(data, encoding="utf-8")
+        self.log(f'Receive from {self.ip}:{self.port}: {data_str}')
+        return data_str
 
     def sendRecvMsg(self, string):
         """
@@ -200,8 +219,14 @@ class DobotApi:
         """
     Close the port
     """
-        if (self.socket_dobot != 0):
-            self.socket_dobot.close()
+        if self.socket_dobot != 0:
+            sock = self.socket_dobot
+            self.socket_dobot = 0
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            sock.close()
 
     def __del__(self):
         self.close()

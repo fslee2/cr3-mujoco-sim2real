@@ -1,0 +1,32 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# IDE and OS metadata
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Generated trajectories and local scratch data
+trajectories/
+tmp/
+
+# Local controller/network experiments and captures
+fake_controller/
+test_step.py
+read_cr3_joint_state.py
+run_cr3_real2sim.py
+*.etl
+*.pcap
+*.pcapng
+
+# Local HaMeR media
+hand_sequence.avi
+*.mp4
+*.avi

@@ -7,6 +7,17 @@ English version of the README -> please [click here](./README-EN.md)
 
 Dobot   TCP-IP-Python-V3   二次开发api接口 （ [TCP-IP-Python-V3 Public English README](https://github.com/Dobot-Arm/TCP-IP-Python-V3.git) ）
 
+## CR3 MuJoCo 数字孪生扩展
+
+本分支新增仿真优先的 CR3 控制工具：自定义中英文 GUI、MuJoCo 离屏画面、
+轨迹录制与低速回放、实时同步、示教拖拽、力矩/电流/六维力反馈，以及可选的
+HaMeR 手部位置映射。实体操作默认锁定，必须显式传入
+`--enable-real-execution` 并经过 GUI 确认。
+
+- [中文使用与安全说明](docs/keyboard_sim2real.md)
+- [English guide](docs/keyboard_sim2real_en.md)
+- 依赖安装：`python -m pip install -r requirements-sim2real.txt`
+
 
 
 # 1. 简介

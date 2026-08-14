@@ -7,6 +7,18 @@ Chinese version of the README -> please [click here](./README.md)
 
 Dobot   TCP-IP-Python-V3   secondary development API interface ([TCP-IP-Python-V3 Public Chinese README](https://github.com/Dobot-Arm/TCP-IP-Python-V3.git))
 
+## CR3 MuJoCo digital-twin extension
+
+This branch adds a simulation-first CR3 controller with a bilingual custom
+GUI, MuJoCo off-screen rendering, trajectory recording and guarded playback,
+live synchronization, teaching/drag mode, force telemetry, and optional HaMeR
+hand-position mapping. Real operations remain locked unless
+`--enable-real-execution` is supplied and the GUI confirmations are completed.
+
+- [English setup and safety guide](docs/keyboard_sim2real_en.md)
+- [中文说明](docs/keyboard_sim2real.md)
+- Install dependencies with `python -m pip install -r requirements-sim2real.txt`
+
 # 1\. Introduction
 
 **TCP-IP-Python-V3** is a software development kit designed by Dobot based on Python of TCP/IP protocol. It is developed based on Python language, follows the Dobot-TCP-IP control communication protocol, connects to the device terminal via Socket, and provides users with an easy-to-use API interface. Through TCP-IP-Python-V3, users can quickly connect to the Dobot device and carry out secondary development to control and use the device.
