@@ -9,7 +9,8 @@ Dobot   TCP-IP-Python-V3   二次开发api接口 （ [TCP-IP-Python-V3 Public En
 
 ## CR3 MuJoCo 数字孪生扩展
 
-本分支新增仿真优先的 CR3 控制工具：自定义中英文 GUI、MuJoCo 离屏画面、
+本项目在 Dobot TCP/IP Python V3 SDK 基础上新增仿真优先的 CR3 控制工具：
+自定义中英文 GUI、MuJoCo 离屏画面、
 轨迹录制与低速回放、实时同步、示教拖拽、力矩/电流/六维力反馈，以及可选的
 HaMeR 手部位置映射。实体操作默认锁定，必须显式传入
 `--enable-real-execution` 并经过 GUI 确认。

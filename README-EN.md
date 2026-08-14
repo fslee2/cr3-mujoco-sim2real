@@ -9,10 +9,11 @@ Dobot   TCP-IP-Python-V3   secondary development API interface ([TCP-IP-Python-V
 
 ## CR3 MuJoCo digital-twin extension
 
-This branch adds a simulation-first CR3 controller with a bilingual custom
-GUI, MuJoCo off-screen rendering, trajectory recording and guarded playback,
-live synchronization, teaching/drag mode, force telemetry, and optional HaMeR
-hand-position mapping. Real operations remain locked unless
+This project extends the Dobot TCP/IP Python V3 SDK with a simulation-first
+CR3 controller, bilingual custom GUI, MuJoCo off-screen rendering, trajectory
+recording and guarded playback, live synchronization, teaching/drag mode,
+force telemetry, and optional HaMeR hand-position mapping. Real operations
+remain locked unless
 `--enable-real-execution` is supplied and the GUI confirmations are completed.
 
 - [English setup and safety guide](docs/keyboard_sim2real_en.md)
