@@ -57,7 +57,10 @@ class QuestHandSnapshot:
 
     @property
     def has_wrist(self) -> bool:
-        return self.wrist_position is not None and self.wrist_quaternion is not None
+        # XYZ-only control does not need a wrist orientation.  Quaternion is
+        # still retained in the snapshot for future orientation modes, but a
+        # missing quaternion must not invalidate an otherwise good XYZ sample.
+        return self.wrist_position is not None
 
 
 def parse_quest_line(line: str) -> QuestPacket | None:
@@ -332,7 +335,11 @@ class QuestWristMapper:
         slow_speed_m_s: float = 0.02,
         fast_speed_m_s: float = 0.20,
         filter_reference_hz: float = 60.0,
-        max_predict_s: float = 0.10,
+        # Position control is intentionally non-predictive by default.  A
+        # predictive lead is useful for latency compensation, but it makes a
+        # hand stop/reverse overshoot when UDP timing is irregular.  The GUI
+        # can opt in explicitly if a different transport needs it.
+        max_predict_s: float = 0.0,
         velocity_alpha: float = 0.80,
     ) -> None:
         self.gain = float(gain)
@@ -419,6 +426,16 @@ class QuestWristMapper:
             raise ValueError("Quest robot origin must contain finite values")
         self.ee_origin = ee.copy()
         self._filtered = ee.copy()
+        # Re-anchoring (for example after Home) starts a new motion segment.
+        # Do not carry velocity or packet timing from the previous segment into
+        # the new origin, otherwise the first target can jump or drift.
+        self._velocity = np.zeros(3)
+        self._last_delta = np.zeros(3)
+        self._last_sample_time = None
+        self._last_filter_time = None
+        self.last_wrist_speed_m_s = 0.0
+        self.last_alpha = self.ema_alpha
+        self.last_sample_hz = 0.0
 
     def target_pos(
         self,
