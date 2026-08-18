@@ -43,6 +43,11 @@ LIVE_TARGET_FILTER_FAST_SPEED_DEG_S = 12.0
 # network/scheduling jitter is allowed up to this cap and uses its real dt.
 LIVE_MAX_CONTROL_DT_S = 0.05
 LIVE_IDLE_RESET_S = 0.25
+# Limit only abrupt direction reversals in the host command stream.  This is
+# deliberately separate from the user-selected maximum speed: it removes the
+# high-frequency sign flip visible in ServoJ logs without changing the normal
+# steady-state speed setting.
+LIVE_DIRECTION_CHANGE_ACCEL_DEG_S2 = 180.0
 FEEDBACK_WATCHDOG_S = 0.20
 FEEDBACK_CONNECT_TIMEOUT_S = 2.0
 FEEDBACK_RECONNECT_DELAY_S = 0.25
@@ -735,6 +740,7 @@ class LiveServoHardware:
         self.dashboard: DobotApiDashboard | None = None
         self.move: DobotApiMove | None = None
         self._last_command_deg: np.ndarray | None = None
+        self._command_velocity_deg_s = np.zeros(6, dtype=float)
         self._filtered_target_deg: np.ndarray | None = None
         self._previous_requested_deg: np.ndarray | None = None
         self._last_send_time = 0.0
@@ -761,6 +767,7 @@ class LiveServoHardware:
             )
             require_motion_ready(state)
             self._last_command_deg = state.joints_deg.copy()
+            self._command_velocity_deg_s = np.zeros(6, dtype=float)
             self._filtered_target_deg = state.joints_deg.copy()
             self._previous_requested_deg = state.joints_deg.copy()
             self._last_send_time = time.monotonic()
@@ -836,6 +843,7 @@ class LiveServoHardware:
             # Idle wall time must not enlarge the first step of the next move.
             self._last_send_time = now
             self.last_planned_speed_deg_s = 0.0
+            self._command_velocity_deg_s.fill(0.0)
             return self._last_command_deg.copy()
         # Use the actual interval between accepted commands so the host-side
         # velocity limit remains physically consistent when TCP or Windows
@@ -852,16 +860,46 @@ class LiveServoHardware:
                 max(elapsed, 1.0e-4),
                 LIVE_MAX_CONTROL_DT_S,
             )
-        planned = limit_joint_velocity(
+        candidate = limit_joint_velocity(
             self._last_command_deg,
             filtered_target,
             max_joint_speed_deg_s=self.max_joint_speed_deg_s,
             dt=control_dt,
         )
+        previous_velocity = self._command_velocity_deg_s.copy()
+        candidate_velocity = (candidate - self._last_command_deg) / control_dt
+        # A target reversal is the pattern visible in the submitted log.  Do
+        # not jump from +v to -v in one 30 ms command; decelerate through zero
+        # first.  Same-direction motion keeps the normal rate-limiter output.
+        reversal = (
+            (np.abs(previous_velocity) > 1.0e-6)
+            & (np.abs(candidate_velocity) > 1.0e-6)
+            & (previous_velocity * candidate_velocity < 0.0)
+        )
+        if np.any(reversal):
+            max_velocity_change = (
+                LIVE_DIRECTION_CHANGE_ACCEL_DEG_S2 * control_dt
+            )
+            smoothed_velocity = candidate_velocity.copy()
+            smoothed_velocity[reversal] = previous_velocity[reversal] + np.clip(
+                candidate_velocity[reversal] - previous_velocity[reversal],
+                -max_velocity_change,
+                max_velocity_change,
+            )
+            planned = self._last_command_deg + smoothed_velocity * control_dt
+            # Never move beyond the current filtered target while braking.
+            lower = np.minimum(self._last_command_deg, filtered_target)
+            upper = np.maximum(self._last_command_deg, filtered_target)
+            planned = np.clip(planned, lower, upper)
+        else:
+            planned = candidate
         servo_reply = self.move.ServoJ(
             *planned, t=LIVE_SERVO_T_S, lookahead_time=LIVE_SERVO_LOOKAHEAD, gain=500
         )
         require_command_success("ServoJ", servo_reply)
+        self._command_velocity_deg_s = (
+            planned - self._last_command_deg
+        ) / control_dt
         self.last_planned_speed_deg_s = float(
             np.max(np.abs(planned - self._last_command_deg)) / control_dt
         )
