@@ -2040,7 +2040,17 @@ class CR3ControlGUI:
         self.root.after(20, self._clear_keys_if_window_inactive)
 
     def _clear_keys_if_window_inactive(self) -> None:
-        if self.root.focus_get() is None:
+        # ttk.Combobox creates a transient ``popdown`` widget.  During its
+        # teardown Tk can return a focus path that no longer exists in
+        # ``root.children``; tkinter's focus_get() then raises KeyError while
+        # resolving that stale path.  Treat this short race as an unknown
+        # focus state and wait for the next FocusOut event instead of letting
+        # the periodic callback fail.
+        try:
+            focus = self.root.focus_get()
+        except (KeyError, tk.TclError):
+            return
+        if focus is None:
             self._clear_motion_keys()
             self.keyboard_status_var.set(self._tr("窗口失焦：运动键已清除"))
 
