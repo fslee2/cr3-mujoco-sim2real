@@ -21,8 +21,16 @@ PACKET_MARKER = 0x123456789ABCDEF
 CR3_MAX_JOINT_SPEED_DEG_S = 180.0
 STRICT_20_PERCENT_LIMIT_DEG_S = CR3_MAX_JOINT_SPEED_DEG_S * 0.20
 DEFAULT_LIVE_JOINT_SPEED_DEG_S = 18.0
+DEFAULT_LIVE_TRACKING_ERROR_DEG = 5.0
 LIVE_SERVO_PERIOD_S = 0.03
 LIVE_SERVO_T_S = 0.10
+# Adaptively smooth discrete IK targets before the strict velocity limiter.
+# Slow motion keeps enough smoothing to suppress steps; fast motion minimizes
+# added delay so the physical arm remains responsive.
+LIVE_TARGET_FILTER_SLOW_ALPHA = 0.55
+LIVE_TARGET_FILTER_FAST_ALPHA = 0.90
+LIVE_TARGET_FILTER_SLOW_SPEED_DEG_S = 1.0
+LIVE_TARGET_FILTER_FAST_SPEED_DEG_S = 12.0
 FEEDBACK_WATCHDOG_S = 0.20
 FEEDBACK_CONNECT_TIMEOUT_S = 2.0
 FEEDBACK_RECONNECT_DELAY_S = 0.25
@@ -30,6 +38,7 @@ PLAYBACK_POSITION_TOLERANCE_DEG = 0.20
 PLAYBACK_STOP_SPEED_TOLERANCE_DEG_S = 0.50
 PLAYBACK_WAYPOINT_TIMEOUT_S = 60.0
 PLAYBACK_POLL_PERIOD_S = 0.02
+PLAYBACK_MAX_TRACKING_ERROR_DEG = 5.0
 QUEUE_START_TIMEOUT_S = 2.0
 DRAG_STATE_TIMEOUT_S = 2.5
 
@@ -476,7 +485,7 @@ def joint_target_reached(
 
 
 class PlaybackHardware:
-    """Execute low-speed JointMovJ calls, waiting on 30004 actual feedback."""
+    """Execute a timestamped trajectory as one continuous low-speed ServoJ stream."""
 
     def __init__(
         self,
@@ -491,10 +500,16 @@ class PlaybackHardware:
         self.robot_ip = robot_ip
         self.speed_percent = speed_percent
         self.acceleration_percent = acceleration_percent
-        self.feedback = feedback if feedback is not None else FeedbackReceiver(robot_ip)
+        self.max_joint_speed_deg_s = (
+            CR3_MAX_JOINT_SPEED_DEG_S * speed_percent / 100.0
+        )
+        self.feedback = (
+            feedback if feedback is not None else FeedbackReceiver(robot_ip)
+        )
         self._owns_feedback = feedback is None
         self.dashboard: DobotApiDashboard | None = None
         self.move: DobotApiMove | None = None
+        self._last_command_deg: np.ndarray | None = None
 
     def connect(self) -> RobotFeedback:
         try:
@@ -504,6 +519,7 @@ class PlaybackHardware:
                 else self.feedback.require_fresh(max_age=0.5)
             )
             require_motion_ready(state)
+            self._last_command_deg = state.joints_deg.copy()
             self.dashboard = DobotApiDashboard(self.robot_ip, DASHBOARD_PORT)
             self.move = DobotApiMove(self.robot_ip, MOTION_PORT)
             return state
@@ -513,33 +529,119 @@ class PlaybackHardware:
 
     def execute(
         self,
-        waypoints_deg: list[np.ndarray],
+        timed_waypoints_deg: list[tuple[float, np.ndarray]],
         *,
         stop_event: threading.Event | None = None,
     ) -> None:
-        if self.dashboard is None or self.move is None:
+        if (
+            self.dashboard is None
+            or self.move is None
+            or self._last_command_deg is None
+        ):
             raise RuntimeError("Playback hardware is not connected")
+        stream = self._validate_stream(timed_waypoints_deg)
+        if not stream:
+            raise ValueError("Playback stream is empty")
         self.ensure_queue_running()
-        total = len(waypoints_deg)
-        for index, waypoint in enumerate(waypoints_deg, start=1):
-            if stop_event is not None and stop_event.is_set():
-                raise RuntimeError("Playback cancelled by local emergency stop")
-            require_motion_ready(self.feedback.require_fresh())
+
+        started_at = time.monotonic()
+        previous_stream_time = 0.0
+        for index, (stream_time, requested) in enumerate(stream):
+            elapsed = time.monotonic() - started_at
+            if index < len(stream) - 1 and stream_time < elapsed - LIVE_SERVO_PERIOD_S:
+                continue
+            self._wait_until(started_at + stream_time, stop_event)
+            feedback = self.feedback.require_fresh()
+            require_motion_ready(feedback)
+            self._require_tracking_within_limit(feedback)
+            control_dt = (
+                LIVE_SERVO_PERIOD_S
+                if stream_time == 0.0
+                else stream_time - previous_stream_time
+            )
+            self._send_servo_target(requested, control_dt)
+            previous_stream_time = stream_time
+
+        final_target = stream[-1][1]
+        next_send_at = time.monotonic() + LIVE_SERVO_PERIOD_S
+        while np.max(np.abs(final_target - self._last_command_deg)) > 1e-6:
+            self._wait_until(next_send_at, stop_event)
+            feedback = self.feedback.require_fresh()
+            require_motion_ready(feedback)
+            self._require_tracking_within_limit(feedback)
+            self._send_servo_target(final_target, LIVE_SERVO_PERIOD_S)
+            next_send_at = max(
+                next_send_at + LIVE_SERVO_PERIOD_S,
+                time.monotonic() + LIVE_SERVO_PERIOD_S,
+            )
+
+        arrived = self.wait_for_joint_arrival(final_target, stop_event=stop_event)
+        max_error = float(np.max(np.abs(arrived.joints_deg - final_target)))
+        print(
+            f"Continuous ServoJ playback complete: {len(stream)} samples "
+            f"(max final joint error {max_error:.3f} deg)"
+        )
+
+    @staticmethod
+    def _validate_stream(
+        timed_waypoints_deg: list[tuple[float, np.ndarray]],
+    ) -> list[tuple[float, np.ndarray]]:
+        stream: list[tuple[float, np.ndarray]] = []
+        previous_time = float("-inf")
+        for timestamp, waypoint in timed_waypoints_deg:
+            timestamp = float(timestamp)
             joints = np.asarray(waypoint, dtype=float)
+            if (
+                not np.isfinite(timestamp)
+                or timestamp < 0.0
+                or timestamp <= previous_time
+            ):
+                raise ValueError(
+                    "Playback timestamps must be finite and strictly increasing"
+                )
             if joints.shape != (6,) or not np.isfinite(joints).all():
                 raise ValueError("Invalid playback waypoint")
-            move_reply = self.move.JointMovJ(
-                *joints,
-                f"SpeedJ={self.speed_percent}",
-                f"AccJ={self.acceleration_percent}",
+            stream.append((timestamp, joints.copy()))
+            previous_time = timestamp
+        return stream
+
+    def _send_servo_target(self, requested_deg: np.ndarray, control_dt: float) -> None:
+        assert self.move is not None and self._last_command_deg is not None
+        planned = limit_joint_velocity(
+            self._last_command_deg,
+            requested_deg,
+            max_joint_speed_deg_s=self.max_joint_speed_deg_s,
+            dt=control_dt,
+        )
+        reply = self.move.ServoJ(
+            *planned,
+            t=LIVE_SERVO_T_S,
+            lookahead_time=50,
+            gain=500,
+        )
+        require_command_success("ServoJ", reply)
+        self._last_command_deg = planned
+
+    def _require_tracking_within_limit(self, feedback: RobotFeedback) -> None:
+        assert self._last_command_deg is not None
+        tracking_error = float(
+            np.max(np.abs(feedback.joints_deg - self._last_command_deg))
+        )
+        if tracking_error > PLAYBACK_MAX_TRACKING_ERROR_DEG:
+            raise RuntimeError(
+                f"CR3 playback tracking error {tracking_error:.3f} deg exceeds "
+                f"{PLAYBACK_MAX_TRACKING_ERROR_DEG:.3f} deg"
             )
-            require_command_success("JointMovJ", move_reply)
-            arrived = self.wait_for_joint_arrival(joints, stop_event=stop_event)
-            max_error = float(np.max(np.abs(arrived.joints_deg - joints)))
-            print(
-                f"Waypoint {index}/{total} reached "
-                f"(max joint error {max_error:.3f} deg)"
-            )
+
+    @staticmethod
+    def _wait_until(deadline: float, stop_event: threading.Event | None) -> None:
+        while True:
+            if stop_event is not None and stop_event.is_set():
+                raise RuntimeError("Playback cancelled by local emergency stop")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                return
+            time.sleep(min(remaining, PLAYBACK_POLL_PERIOD_S))
 
     def ensure_queue_running(
         self, timeout: float = QUEUE_START_TIMEOUT_S
@@ -568,6 +670,7 @@ class PlaybackHardware:
                 raise RuntimeError("Playback cancelled by local emergency stop")
             latest = self.feedback.require_fresh()
             require_motion_ready(latest)
+            self._require_tracking_within_limit(latest)
             if joint_target_reached(latest, target):
                 return latest
             time.sleep(PLAYBACK_POLL_PERIOD_S)
@@ -593,26 +696,43 @@ class PlaybackHardware:
 
 
 class LiveServoHardware:
-    """33 Hz ServoJ sender with feedback watchdog and host-side speed limiting."""
+    """Fixed-rate ServoJ stream with feedback watchdog and speed limiting.
+
+    The controller recommends a 30 ms secondary-development cycle. The worker
+    stays independent from GUI rendering so camera and Tk work cannot insert
+    gaps into the robot command stream.
+    """
 
     def __init__(
         self,
         robot_ip: str,
         *,
         max_joint_speed_deg_s: float = DEFAULT_LIVE_JOINT_SPEED_DEG_S,
+        max_tracking_error_deg: float = DEFAULT_LIVE_TRACKING_ERROR_DEG,
         feedback: FeedbackReceiver | None = None,
     ) -> None:
         if not 0.0 < max_joint_speed_deg_s < STRICT_20_PERCENT_LIMIT_DEG_S:
             raise ValueError("Live speed must be positive and strictly below 36 deg/s")
         self.robot_ip = robot_ip
         self.max_joint_speed_deg_s = max_joint_speed_deg_s
+        if not np.isfinite(max_tracking_error_deg) or max_tracking_error_deg <= 0.0:
+            raise ValueError("Live tracking error limit must be positive and finite")
+        self.max_tracking_error_deg = float(max_tracking_error_deg)
         self.feedback = feedback if feedback is not None else FeedbackReceiver(robot_ip)
         self._owns_feedback = feedback is None
         self.dashboard: DobotApiDashboard | None = None
         self.move: DobotApiMove | None = None
         self._last_command_deg: np.ndarray | None = None
+        self._filtered_target_deg: np.ndarray | None = None
+        self._previous_requested_deg: np.ndarray | None = None
         self._last_send_time = 0.0
         self.last_planned_speed_deg_s = 0.0
+        self.last_target_filter_alpha = LIVE_TARGET_FILTER_SLOW_ALPHA
+        self._stream_lock = threading.Lock()
+        self._stream_target_deg: np.ndarray | None = None
+        self._stream_error: Exception | None = None
+        self._stream_stop = threading.Event()
+        self._stream_thread: threading.Thread | None = None
 
     def set_max_joint_speed(self, max_joint_speed_deg_s: float) -> None:
         """Update the host-side live speed limit while synchronization runs."""
@@ -629,6 +749,8 @@ class LiveServoHardware:
             )
             require_motion_ready(state)
             self._last_command_deg = state.joints_deg.copy()
+            self._filtered_target_deg = state.joints_deg.copy()
+            self._previous_requested_deg = state.joints_deg.copy()
             self._last_send_time = time.monotonic()
             self.dashboard = DobotApiDashboard(self.robot_ip, DASHBOARD_PORT)
             self.move = DobotApiMove(self.robot_ip, MOTION_PORT)
@@ -646,11 +768,59 @@ class LiveServoHardware:
         if elapsed < LIVE_SERVO_PERIOD_S:
             return self._last_command_deg.copy()
 
-        require_motion_ready(self.feedback.require_fresh())
+        feedback = self.feedback.require_fresh()
+        require_motion_ready(feedback)
+        tracking_error = float(
+            np.max(np.abs(feedback.joints_deg - self._last_command_deg))
+        )
+        if tracking_error > self.max_tracking_error_deg:
+            raise RuntimeError(
+                f"CR3 live tracking error {tracking_error:.3f} deg exceeds "
+                f"{self.max_tracking_error_deg:.3f} deg"
+            )
         requested = np.asarray(requested_deg, dtype=float)
         if requested.shape != (6,) or not np.isfinite(requested).all():
             raise ValueError("Invalid live ServoJ target")
-        if np.max(np.abs(requested - self._last_command_deg)) < 1e-6:
+        if self._filtered_target_deg is None:
+            self._filtered_target_deg = requested.copy()
+            filter_alpha = LIVE_TARGET_FILTER_FAST_ALPHA
+        else:
+            if self._previous_requested_deg is None:
+                input_speed_deg_s = LIVE_TARGET_FILTER_FAST_SPEED_DEG_S
+            else:
+                input_speed_deg_s = float(
+                    np.max(np.abs(requested - self._previous_requested_deg))
+                    / LIVE_SERVO_PERIOD_S
+                )
+            speed_blend = float(
+                np.clip(
+                    (
+                        input_speed_deg_s
+                        - LIVE_TARGET_FILTER_SLOW_SPEED_DEG_S
+                    )
+                    / (
+                        LIVE_TARGET_FILTER_FAST_SPEED_DEG_S
+                        - LIVE_TARGET_FILTER_SLOW_SPEED_DEG_S
+                    ),
+                    0.0,
+                    1.0,
+                )
+            )
+            filter_alpha = (
+                LIVE_TARGET_FILTER_SLOW_ALPHA
+                + speed_blend
+                * (
+                    LIVE_TARGET_FILTER_FAST_ALPHA
+                    - LIVE_TARGET_FILTER_SLOW_ALPHA
+                )
+            )
+            self._filtered_target_deg += filter_alpha * (
+                requested - self._filtered_target_deg
+            )
+        self._previous_requested_deg = requested.copy()
+        self.last_target_filter_alpha = float(filter_alpha)
+        filtered_target = self._filtered_target_deg.copy()
+        if np.max(np.abs(filtered_target - self._last_command_deg)) < 1e-6:
             # Idle wall time must not enlarge the first step of the next move.
             self._last_send_time = now
             self.last_planned_speed_deg_s = 0.0
@@ -660,7 +830,7 @@ class LiveServoHardware:
         control_dt = LIVE_SERVO_PERIOD_S
         planned = limit_joint_velocity(
             self._last_command_deg,
-            requested,
+            filtered_target,
             max_joint_speed_deg_s=self.max_joint_speed_deg_s,
             dt=control_dt,
         )
@@ -675,12 +845,125 @@ class LiveServoHardware:
         self._last_send_time = now
         return planned.copy()
 
+    def latest_command_deg(self) -> np.ndarray:
+        """Return the latest rate-limited target actually accepted for ServoJ."""
+        if self._last_command_deg is None:
+            raise RuntimeError("Live hardware is not connected")
+        return self._last_command_deg.copy()
+
+    def start_stream(self, requested_deg) -> None:
+        """Start a fixed 33 Hz latest-target ServoJ worker."""
+        if self.move is None or self._last_command_deg is None:
+            raise RuntimeError("Live hardware is not connected")
+        self.set_stream_target(requested_deg)
+        if self._stream_thread is not None and self._stream_thread.is_alive():
+            return
+        with self._stream_lock:
+            self._stream_error = None
+        self._stream_stop.clear()
+        self._stream_thread = threading.Thread(
+            target=self._stream_loop,
+            name="cr3-servoj-stream",
+            daemon=True,
+        )
+        self._stream_thread.start()
+
+    def set_stream_target(self, requested_deg) -> None:
+        """Publish the newest six-joint target without blocking the caller."""
+        requested = np.asarray(requested_deg, dtype=float)
+        if requested.shape != (6,) or not np.isfinite(requested).all():
+            raise ValueError("Invalid live ServoJ target")
+        with self._stream_lock:
+            self._stream_target_deg = requested.copy()
+
+    def raise_stream_error(self) -> None:
+        """Propagate a worker failure on the GUI thread."""
+        with self._stream_lock:
+            error = self._stream_error
+        if error is not None:
+            raise RuntimeError(f"CR3 ServoJ stream stopped: {error}") from error
+
+    def _stream_loop(self) -> None:
+        next_send_at = time.monotonic() + LIVE_SERVO_PERIOD_S
+        while not self._stream_stop.is_set():
+            wait_s = max(0.0, next_send_at - time.monotonic())
+            if self._stream_stop.wait(wait_s):
+                break
+            with self._stream_lock:
+                target = (
+                    None
+                    if self._stream_target_deg is None
+                    else self._stream_target_deg.copy()
+                )
+            if target is not None:
+                try:
+                    self.send_if_due(target, now=time.monotonic())
+                except Exception as exc:
+                    with self._stream_lock:
+                        self._stream_error = exc
+                    self._stream_stop.set()
+                    break
+            next_send_at += LIVE_SERVO_PERIOD_S
+            # Do not burst stale commands after any network delay.
+            now = time.monotonic()
+            if next_send_at < now:
+                next_send_at = now + LIVE_SERVO_PERIOD_S
+
     def close(self) -> None:
+        self._stream_stop.set()
+        stream_thread = self._stream_thread
+        # Close 30003 first to release a worker blocked waiting for a reply.
         if self.move is not None:
             self.move.close()
             self.move = None
+        if (
+            stream_thread is not None
+            and stream_thread is not threading.current_thread()
+        ):
+            stream_thread.join(timeout=1.0)
+        self._stream_thread = None
         if self.dashboard is not None:
             self.dashboard.close()
             self.dashboard = None
         if self._owns_feedback:
             self.feedback.close()
+
+
+def stream_live_target_until_reached(
+    hardware: LiveServoHardware,
+    target_deg,
+    *,
+    stop_event: threading.Event | None = None,
+    timeout: float = 90.0,
+) -> RobotFeedback:
+    """Move to one joint target through the guarded live ServoJ limiter.
+
+    This is used for explicit low-speed preparation moves such as returning
+    both HaMeR control sides to the shared Home pose.  It never bypasses
+    ``LiveServoHardware.send_if_due`` or the 30004 feedback watchdog.
+    """
+    target = np.asarray(target_deg, dtype=float)
+    if target.shape != (6,) or not np.isfinite(target).all():
+        raise ValueError("Live target must contain six finite joints")
+    if not np.isfinite(timeout) or timeout <= 0.0:
+        raise ValueError("Live target timeout must be positive and finite")
+
+    deadline = time.monotonic() + float(timeout)
+    latest: RobotFeedback | None = None
+    while time.monotonic() < deadline:
+        if stop_event is not None and stop_event.is_set():
+            raise RuntimeError("Live target move cancelled")
+        latest = hardware.feedback.require_fresh()
+        require_motion_ready(latest)
+        if joint_target_reached(latest, target):
+            return latest
+        hardware.send_if_due(target)
+        time.sleep(0.005)
+
+    if latest is None:
+        raise TimeoutError("No CR3 feedback while moving to live target")
+    error = float(np.max(np.abs(latest.joints_deg - target)))
+    raise TimeoutError(
+        f"CR3 did not reach live target within {timeout:.1f} s "
+        f"(max error {error:.3f} deg)"
+    )

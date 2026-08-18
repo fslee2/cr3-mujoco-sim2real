@@ -159,10 +159,14 @@ class BridgeSnapshot:
     result: dict[str, Any] | None
     frame_bgr: np.ndarray | None
     status: str
+    frame_sequence: int = 0
+    request_latency_s: float = 0.0
+    request_in_flight: bool = False
+    result_at: float = 0.0
 
 
 class HamerBridgeTracker:
-    """Capture local frames and POST them to a HaMeR ``/infer`` endpoint."""
+    """Keep camera display live while HaMeR processes the newest full frame."""
 
     def __init__(
         self,
@@ -188,12 +192,21 @@ class HamerBridgeTracker:
 
         self._lock = threading.Lock()
         self._running = False
-        self._thread: threading.Thread | None = None
+        self._capture_thread: threading.Thread | None = None
+        self._inference_thread: threading.Thread | None = None
+        self._inference_ready = threading.Event()
         self._capture = None
         self._sequence = 0
+        self._frame_sequence = 0
+        self._inference_frame_sequence = 0
+        self._inference_frame: np.ndarray | None = None
+        self._capture_ended = False
         self._result: dict[str, Any] | None = None
         self._frame: np.ndarray | None = None
         self._status = "HaMeR bridge not started"
+        self._request_latency_s = 0.0
+        self._request_in_flight = False
+        self._result_at = 0.0
 
     @property
     def running(self) -> bool:
@@ -213,9 +226,21 @@ class HamerBridgeTracker:
             raise RuntimeError(f"Could not open HaMeR source: {source}")
         capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         self._capture = capture
+        self._capture_ended = False
+        self._inference_ready.clear()
         self._running = True
-        self._thread = threading.Thread(target=self._loop, name="hamer-bridge", daemon=True)
-        self._thread.start()
+        self._capture_thread = threading.Thread(
+            target=self._capture_loop,
+            name="hamer-capture",
+            daemon=True,
+        )
+        self._inference_thread = threading.Thread(
+            target=self._inference_loop,
+            name="hamer-inference",
+            daemon=True,
+        )
+        self._capture_thread.start()
+        self._inference_thread.start()
 
     def _open_camera(self):
         backend = self.camera_backend
@@ -236,30 +261,71 @@ class HamerBridgeTracker:
             else cv2.VideoCapture(self.camera_id, selected)
         )
 
-    def _loop(self) -> None:
+    def _capture_loop(self) -> None:
         assert self._capture is not None
         frame_index = 0
-        encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality]
         try:
             while self._running:
                 ok, frame = self._capture.read()
                 if not ok:
-                    status = "HaMeR video ended" if self.video_path is not None else "HaMeR camera has no frames"
+                    status = (
+                        "HaMeR video ended"
+                        if self.video_path is not None
+                        else "HaMeR camera has no frames"
+                    )
                     with self._lock:
                         self._status = status
+                        if self.video_path is not None:
+                            self._capture_ended = True
                     if self.video_path is not None:
+                        self._inference_ready.set()
                         break
                     time.sleep(0.05)
                     continue
                 frame = cv2.flip(frame, 1)
                 frame_index += 1
-                if frame_index % self.frame_stride:
-                    with self._lock:
-                        self._frame = frame.copy()
+                selected = frame_index % self.frame_stride == 0
+                with self._lock:
+                    self._frame_sequence += 1
+                    self._frame = frame.copy()
+                    if selected:
+                        self._inference_frame_sequence = self._frame_sequence
+                        self._inference_frame = frame.copy()
+                if selected:
+                    self._inference_ready.set()
+        finally:
+            with self._lock:
+                self._capture_ended = True
+            self._inference_ready.set()
+
+    def _inference_loop(self) -> None:
+        # These match the original working demo exactly: mirrored once by the
+        # capture loop, no resize, and JPEG quality 80 by default.
+        encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality]
+        consumed_sequence = 0
+        try:
+            while self._running:
+                self._inference_ready.wait(timeout=0.1)
+                self._inference_ready.clear()
+                with self._lock:
+                    frame_sequence = self._inference_frame_sequence
+                    frame = (
+                        None
+                        if self._inference_frame is None
+                        else self._inference_frame.copy()
+                    )
+                    capture_ended = self._capture_ended
+                if frame is None or frame_sequence == consumed_sequence:
+                    if capture_ended:
+                        break
                     continue
+                consumed_sequence = frame_sequence
 
                 result = None
-                status = "sending frame to HaMeR bridge"
+                status = self._status
+                with self._lock:
+                    self._request_in_flight = True
+                request_started_at = time.monotonic()
                 try:
                     ok, jpg = cv2.imencode(".jpg", frame, encode_params)
                     if not ok:
@@ -279,39 +345,73 @@ class HamerBridgeTracker:
                 except (urllib.error.URLError, TimeoutError, RuntimeError, json.JSONDecodeError) as exc:
                     status = f"HaMeR bridge error: {exc}"
 
-                annotated = frame.copy()
-                color = (60, 220, 100) if hamer_cam_t(result) is not None else (40, 80, 240)
-                cv2.putText(
-                    annotated,
-                    status[:80],
-                    (10, 28),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.58,
-                    color,
-                    2,
-                )
+                request_latency = time.monotonic() - request_started_at
                 with self._lock:
                     self._sequence += 1
                     self._result = result
-                    self._frame = annotated
                     self._status = status
+                    self._request_latency_s = request_latency
+                    self._request_in_flight = False
+                    self._result_at = time.monotonic()
+                    capture_ended = self._capture_ended
+                    newest_sequence = self._inference_frame_sequence
+                if capture_ended and newest_sequence == consumed_sequence:
+                    break
         finally:
+            with self._lock:
+                self._request_in_flight = False
             self._running = False
 
     def get(self) -> BridgeSnapshot:
         with self._lock:
-            return BridgeSnapshot(
-                sequence=self._sequence,
-                result=None if self._result is None else dict(self._result),
-                frame_bgr=None if self._frame is None else self._frame.copy(),
-                status=self._status,
+            sequence = self._sequence
+            result = None if self._result is None else dict(self._result)
+            frame = None if self._frame is None else self._frame.copy()
+            status = self._status
+            frame_sequence = self._frame_sequence
+            request_latency_s = self._request_latency_s
+            request_in_flight = self._request_in_flight
+            result_at = self._result_at
+        if frame is not None:
+            color = (
+                (60, 220, 100)
+                if hamer_cam_t(result) is not None
+                else (40, 80, 240)
             )
+            display_status = (
+                f"infer pending | last: {status}"
+                if request_in_flight
+                else status
+            )
+            cv2.putText(
+                frame,
+                display_status[:100],
+                (10, 28),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.58,
+                color,
+                2,
+            )
+        return BridgeSnapshot(
+            sequence=sequence,
+            result=result,
+            frame_bgr=frame,
+            status=status,
+            frame_sequence=frame_sequence,
+            request_latency_s=request_latency_s,
+            request_in_flight=request_in_flight,
+            result_at=result_at,
+        )
 
     def stop(self) -> None:
         self._running = False
+        self._inference_ready.set()
         if self._capture is not None:
             self._capture.release()
-        if self._thread is not None and self._thread is not threading.current_thread():
-            self._thread.join(timeout=1.5)
-        self._thread = None
+        current = threading.current_thread()
+        for thread in (self._capture_thread, self._inference_thread):
+            if thread is not None and thread is not current:
+                thread.join(timeout=1.5)
+        self._capture_thread = None
+        self._inference_thread = None
         self._capture = None

@@ -1,8 +1,9 @@
 import socket
 import tempfile
+import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import mujoco
 from mujoco.glfw import glfw
@@ -14,6 +15,8 @@ from cr3_sim2real.hardware import (
     DEFAULT_LIVE_JOINT_SPEED_DEG_S,
     PACKET_MARKER,
     LIVE_SERVO_PERIOD_S,
+    LIVE_TARGET_FILTER_FAST_ALPHA,
+    LIVE_TARGET_FILTER_SLOW_ALPHA,
     STRICT_20_PERCENT_LIMIT_DEG_S,
     LiveServoHardware,
     FeedbackReceiver,
@@ -33,20 +36,167 @@ from cr3_sim2real.hardware import (
     set_robot_speed_factor,
     start_drag_mode,
     stop_drag_mode,
+    stream_live_target_until_reached,
     wait_for_drag_state,
 )
-from cr3_sim2real.hamer_bridge import HamerArmMapper, hamer_cam_t
+from cr3_sim2real.hamer_bridge import (
+    HamerArmMapper,
+    HamerBridgeTracker,
+    hamer_cam_t,
+)
+from cr3_sim2real.hamer_real import (
+    HamerRealCommandPreview,
+    HamerRealSafetyConfig,
+)
 from cr3_sim2real.joint_mapping import real_deg_to_sim_rad, sim_rad_to_real_deg
+from cr3_sim2real.quest_hand import (
+    QuestHandReceiver,
+    QuestWristMapper,
+    parse_quest_line,
+)
 from cr3_sim2real.trajectory import (
     TrajectoryPoint,
     TrajectoryRecorder,
     build_jointmovj_dry_run,
+    build_servoj_dry_run,
     downsample_points,
+    resample_joint_trajectory,
     validate_trajectory,
 )
 
 
 class KeyboardSim2RealTests(unittest.TestCase):
+    def test_quest_parser_accepts_original_and_debug_headers(self):
+        wrist = parse_quest_line(
+            "Right wrist:, 0.1, 0.2, 0.3, 0.0, 0.1, 0.2, 0.97"
+        )
+        self.assertIsNotNone(wrist)
+        self.assertEqual(wrist.side, "right")
+        self.assertEqual(wrist.kind, "wrist")
+        np.testing.assert_allclose(wrist.values[:3], [0.1, 0.2, 0.3])
+
+        values = ", ".join(str(value / 100.0) for value in range(63))
+        landmarks = parse_quest_line(
+            f"Left landmarks | f = 42 | t = 123456789:,{values}"
+        )
+        self.assertIsNotNone(landmarks)
+        self.assertEqual(landmarks.frame_id, 42)
+        self.assertEqual(landmarks.device_timestamp_ns, 123456789)
+        self.assertEqual(landmarks.values.shape, (21, 3))
+
+    def test_quest_receiver_combines_original_repository_lines(self):
+        receiver = QuestHandReceiver()
+        receiver._accept_text(
+            "Right wrist:, 0.1, 0.2, 0.3, 0, 0, 0, 1",
+            "192.0.2.20:9000",
+        )
+        wrist_only = receiver.get("right")
+        receiver._accept_text(
+            "Right landmarks:, " + ", ".join(["0"] * 63),
+            "192.0.2.20:9000",
+        )
+        snapshot = receiver.get("right")
+        self.assertTrue(snapshot.has_wrist)
+        np.testing.assert_allclose(snapshot.wrist_position, [0.1, 0.2, 0.3])
+        self.assertEqual(snapshot.landmarks.shape, (21, 3))
+        self.assertEqual(snapshot.sender, "192.0.2.20:9000")
+        self.assertEqual(wrist_only.wrist_sequence, 1)
+        self.assertEqual(snapshot.wrist_sequence, 1)
+        self.assertEqual(snapshot.landmarks_sequence, 1)
+        self.assertGreater(snapshot.sequence, wrist_only.sequence)
+
+    def test_quest_wrist_mapper_uses_unity_to_robot_axes(self):
+        mapper = QuestWristMapper(
+            gain=1.0,
+            max_delta_m=1.0,
+            deadzone_m=0.0,
+            ema_alpha=1.0,
+        )
+        mapper.calibrate([1.0, 2.0, 3.0], [0.4, 0.5, 0.6])
+        target = mapper.target_pos([1.1, 2.2, 3.3])
+        # Unity (right, up, forward) -> robot (forward, left, up).
+        np.testing.assert_allclose(target, [0.7, 0.4, 0.8])
+
+    def test_quest_adaptive_filter_reacts_faster_to_fast_motion(self):
+        mapper = QuestWristMapper(
+            gain=1.0,
+            max_delta_m=1.0,
+            deadzone_m=0.0,
+            ema_alpha=0.20,
+            fast_ema_alpha=0.90,
+            slow_speed_m_s=0.02,
+            fast_speed_m_s=0.20,
+            filter_reference_hz=60.0,
+        )
+        mapper.calibrate([0.0, 0.0, 0.0], [0.0, 0.0, 0.0], timestamp=1.0)
+        slow_target = mapper.target_pos(
+            [0.0, 0.0, 0.0001], timestamp=1.0 + 1.0 / 60.0
+        )
+        slow_alpha = mapper.last_alpha
+
+        mapper.calibrate([0.0, 0.0, 0.0], [0.0, 0.0, 0.0], timestamp=2.0)
+        fast_target = mapper.target_pos(
+            [0.0, 0.0, 0.01], timestamp=2.0 + 1.0 / 60.0
+        )
+        fast_alpha = mapper.last_alpha
+
+        self.assertLess(slow_alpha, fast_alpha)
+        self.assertLess(slow_target[0] / 0.0001, fast_target[0] / 0.01)
+        self.assertAlmostEqual(mapper.last_sample_hz, 60.0, places=5)
+
+    def test_cartesian_tracking_limit_uses_speed_and_caps_stale_dt(self):
+        limited = gui.limit_cartesian_tracking_step(
+            [0.10, 0.0, 0.0], max_speed_m_s=0.8, dt=0.02
+        )
+        self.assertAlmostEqual(np.linalg.norm(limited), 0.016)
+        stale = gui.limit_cartesian_tracking_step(
+            [0.10, 0.0, 0.0], max_speed_m_s=0.8, dt=1.0
+        )
+        self.assertAlmostEqual(
+            np.linalg.norm(stale),
+            0.8 * gui.QUEST_MAX_CONTROL_DT_S,
+        )
+
+    def test_quest_real_watchdog_stops_stale_wrist_stream(self):
+        controller = object.__new__(gui.CR3ControlGUI)
+        controller.quest_real_stage = "active"
+        controller.quest_last_valid_wrist_at = 1.0
+        controller.stop_quest_real_sync = Mock()
+        controller._check_quest_real_sync(
+            1.0 + gui.HAMER_REAL_HAND_WATCHDOG_S + 0.01
+        )
+        controller.stop_quest_real_sync.assert_called_once()
+        self.assertIn(
+            "腕部数据",
+            controller.stop_quest_real_sync.call_args.args[0],
+        )
+
+    def test_quest_real_second_confirmation_expires(self):
+        controller = object.__new__(gui.CR3ControlGUI)
+        controller.quest_real_stage = "ready"
+        controller.quest_real_confirm_until = 10.0
+        controller.stop_quest_real_sync = Mock()
+        controller._check_quest_real_sync(10.1)
+        controller.stop_quest_real_sync.assert_called_once_with(
+            "Quest 实机同步第二次确认已超时。"
+        )
+
+    def test_quest_real_speed_edit_applies_immediately(self):
+        class Variable:
+            def get(self):
+                return "7.5"
+
+        hardware = Mock()
+        controller = object.__new__(gui.CR3ControlGUI)
+        controller.live_hardware = hardware
+        controller.quest_real_stage = "active"
+        controller.quest_real_speed_var = Variable()
+        controller.last_applied_live_speed = 5.0
+        controller.log = Mock()
+        controller._apply_quest_real_speed_setting()
+        hardware.set_max_joint_speed.assert_called_once_with(7.5)
+        self.assertEqual(controller.last_applied_live_speed, 7.5)
+
     def test_gui_language_translation_switches_both_directions(self):
         controller = object.__new__(gui.CR3ControlGUI)
         controller.language = "en"
@@ -55,6 +205,218 @@ class KeyboardSim2RealTests(unittest.TestCase):
         controller.language = "zh"
         self.assertEqual(controller._tr("使能"), "使能")
         self.assertEqual(gui.UI_TEXT_ZH["Record"], "录制后回放")
+
+    def test_gui_robot_ip_validation_and_pending_edit_lock(self):
+        class Variable:
+            def __init__(self, value):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+        controller = object.__new__(gui.CR3ControlGUI)
+        controller.language = "zh"
+        controller.robot_ip_var = Variable(" 192.168.5.12 ")
+        controller.monitor = Mock(robot_ip="192.168.5.11")
+        controller.connected_robot_ip = "192.168.5.11"
+        controller.robot_connection_var = Mock()
+        controller.log = Mock()
+
+        self.assertEqual(
+            controller._normalize_robot_ip(" 192.168.5.11 "),
+            "192.168.5.11",
+        )
+        self.assertIsNone(controller._active_robot_ip())
+        self.assertEqual(
+            controller._connected_robot_ip_for_stop(),
+            "192.168.5.11",
+        )
+        controller.log.assert_called()
+
+        with self.assertRaises(ValueError):
+            controller._normalize_robot_ip("192.168.5.999")
+
+    @patch("run_keyboard_sim2real_gui.FeedbackReceiver")
+    def test_gui_switches_feedback_and_commits_the_new_ip(self, receiver_type):
+        class Variable:
+            def __init__(self, value=""):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+            def set(self, value):
+                self.value = value
+
+        old_receiver = Mock(robot_ip="192.168.5.11")
+        new_receiver = Mock(robot_ip="192.168.5.12")
+        state = Mock(
+            joints_deg=np.zeros(6),
+            robot_mode=5,
+            enabled=True,
+            error=False,
+            paused=False,
+            queue_running=False,
+        )
+        new_receiver.start.return_value = state
+        receiver_type.return_value = new_receiver
+
+        controller = object.__new__(gui.CR3ControlGUI)
+        controller.language = "zh"
+        controller.robot_ip_var = Variable("192.168.5.12")
+        controller.robot_connection_var = Variable()
+        controller.robot_status_var = Variable()
+        controller.monitor = old_receiver
+        controller.connected_robot_ip = "192.168.5.11"
+        controller.feedback_connecting_ip = None
+        controller.robot_ip_history = ["192.168.5.11"]
+        controller.robot_ip_combo = Mock()
+        controller.feedback_connect_button = Mock()
+        controller.dashboard_action_busy = False
+        controller.real_busy = False
+        controller.live_hardware = None
+        controller.live_starting = False
+        controller.teach_active = False
+        controller.teach_starting = False
+        controller.hamer_real_stage = "idle"
+        controller.quest_real_stage = "idle"
+        controller.recorder = Mock(recording=False)
+        controller.log = Mock()
+        controller._update_feedback_display = Mock()
+        controller._set_sim_from_real = Mock()
+        controller._background = lambda work, success, _failure: success(work())
+
+        controller.connect_feedback()
+
+        old_receiver.close.assert_called_once()
+        receiver_type.assert_called_once_with("192.168.5.12")
+        self.assertIs(controller.monitor, new_receiver)
+        self.assertEqual(controller.connected_robot_ip, "192.168.5.12")
+        self.assertEqual(
+            controller.robot_ip_history,
+            ["192.168.5.11", "192.168.5.12"],
+        )
+
+    def test_english_runtime_log_translation_preserves_dynamic_values(self):
+        translated = gui.translate_runtime_log(
+            "HaMeR 实机同步最终检查失败：当前没有有效手部 cam_t"
+        )
+        self.assertEqual(
+            translated,
+            "HaMeR Robot Sync final check failed: no valid hand cam_t is available",
+        )
+        self.assertEqual(
+            gui.translate_runtime_log("平移步长 必须在 0.1 到 50 之间"),
+            "translation step must be between 0.1 and 50",
+        )
+        self.assertEqual(
+            gui.translate_runtime_log(
+                "Quest UDP 正在监听 0.0.0.0:9000，控制手=right。"
+            ),
+            "Quest UDP listening on 0.0.0.0:9000, control hand=right.",
+        )
+        self.assertFalse(any("\u3400" <= char <= "\u9fff" for char in translated))
+        self.assertEqual(gui.UI_TEXT_EN["清空日志"], "Clear Log")
+        self.assertEqual(gui.UI_TEXT_EN["实机回 Home"], "Robot Home")
+
+    def test_escape_forces_disable_without_requiring_canvas_focus(self):
+        controller = object.__new__(gui.CR3ControlGUI)
+        controller._clear_motion_keys = Mock()
+        controller.on_disable = Mock()
+
+        result = controller._key_press(Mock(keysym="Escape"))
+
+        self.assertEqual(result, "break")
+        controller._clear_motion_keys.assert_called_once_with()
+        controller.on_disable.assert_called_once_with(confirm=False, force=True)
+
+    @patch("run_keyboard_sim2real_gui.messagebox.askyesno")
+    @patch("run_keyboard_sim2real_gui.disable_robot")
+    def test_forced_disable_has_no_confirmation_dialog(self, disable, askyesno):
+        disable.return_value = "0,{},DisableRobot();"
+        controller = object.__new__(gui.CR3ControlGUI)
+        controller.args = Mock(enable_real_execution=True)
+        controller.disable_in_progress = False
+        controller.dashboard_action_busy = True
+        controller._connected_robot_ip_for_stop = Mock(
+            return_value="192.168.5.11"
+        )
+        controller.real_busy = True
+        controller.recorder = Mock(recording=False)
+        controller._clear_motion_keys = Mock()
+        controller.real_stop_event = Mock()
+        controller.armed_until = 10.0
+        controller.arm_status_var = Mock()
+        controller.live_starting = True
+        controller.hamer_real_stage = "active"
+        controller.hamer_real_confirm_until = 10.0
+        controller.quest_real_stage = "active"
+        controller.quest_real_confirm_until = 10.0
+        controller.teach_active = True
+        controller.teach_starting = True
+        controller.teach_button = Mock()
+        controller.teach_status_var = Mock()
+        controller.live_hardware = None
+        controller.last_applied_live_speed = 5.0
+        controller.live_button = Mock()
+        controller.live_speed_status_var = Mock()
+        controller.status_var = Mock()
+        controller.monitor = Mock()
+        controller.log = Mock()
+        controller._set_button_text = Mock()
+        controller._background = lambda work, success, _failure: success(work())
+
+        controller.on_disable(confirm=False, force=True)
+
+        askyesno.assert_not_called()
+        disable.assert_called_once_with(
+            "192.168.5.11", feedback=controller.monitor
+        )
+        controller.real_stop_event.set.assert_called_once_with()
+        controller._clear_motion_keys.assert_called_once_with()
+        self.assertIsNone(controller.live_hardware)
+        self.assertEqual(controller.hamer_real_stage, "idle")
+        self.assertEqual(controller.quest_real_stage, "idle")
+        self.assertFalse(controller.teach_active)
+        self.assertFalse(controller.disable_in_progress)
+
+    def test_manual_real_home_completion_realigns_hand_origins(self):
+        controller = object.__new__(gui.CR3ControlGUI)
+        controller.real_busy = True
+        controller.manual_home_active = True
+        controller.real_home_button = Mock()
+        controller._set_button_text = Mock()
+        home_ee = np.array([0.1, 0.2, 0.3])
+        controller._set_sim_home_now = Mock(return_value=home_ee)
+        controller.hamer_mapper = Mock(calibrated=True)
+        controller.quest_mapper = Mock(calibrated=True)
+        controller._update_feedback_display = Mock()
+        controller.status_var = Mock()
+        controller.log = Mock()
+        state = Mock()
+
+        controller._real_home_complete(state)
+
+        self.assertFalse(controller.real_busy)
+        self.assertFalse(controller.manual_home_active)
+        controller.hamer_mapper.reanchor_robot_origin.assert_called_once_with(home_ee)
+        controller.quest_mapper.reanchor_robot_origin.assert_called_once_with(home_ee)
+        controller._update_feedback_display.assert_called_once_with(state)
+
+    def test_manual_real_home_button_can_cancel_homing(self):
+        controller = object.__new__(gui.CR3ControlGUI)
+        controller.manual_home_active = True
+        controller.real_stop_event = Mock()
+        controller.real_home_button = Mock()
+        controller._set_button_text = Mock()
+        controller.log = Mock()
+
+        controller.toggle_real_home()
+
+        controller.real_stop_event.set.assert_called_once_with()
+        controller._set_button_text.assert_called_once_with(
+            controller.real_home_button, "正在停止实机 Home…"
+        )
 
     @patch("cr3_sim2real.hardware.socket.create_connection")
     def test_feedback_receiver_reconnects_after_connection_reset(
@@ -144,6 +506,61 @@ class KeyboardSim2RealTests(unittest.TestCase):
         )
         mapper.clear_origin()
         self.assertFalse(mapper.calibrated)
+
+    @patch("cr3_sim2real.hamer_bridge.urllib.request.urlopen")
+    @patch("cr3_sim2real.hamer_bridge.cv2.VideoCapture")
+    def test_hamer_camera_keeps_updating_during_slow_original_inference(
+        self,
+        video_capture,
+        urlopen,
+    ):
+        class FakeCapture:
+            def __init__(self):
+                self.released = False
+                self.index = 0
+
+            def isOpened(self):
+                return True
+
+            def set(self, *_args):
+                return True
+
+            def read(self):
+                time.sleep(0.005)
+                if self.released:
+                    return False, None
+                self.index += 1
+                return True, np.full((48, 64, 3), self.index % 255, dtype=np.uint8)
+
+            def release(self):
+                self.released = True
+
+        class SlowResponse:
+            def __enter__(self):
+                time.sleep(0.10)
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return b'{"ok":true,"status":"HaMeR right hand detected","result":{"cam_t":[0,0,1]}}'
+
+        video_capture.return_value = FakeCapture()
+        urlopen.side_effect = lambda *_args, **_kwargs: SlowResponse()
+        tracker = HamerBridgeTracker("http://127.0.0.1:8765", camera_backend="any")
+        tracker.start()
+        try:
+            deadline = time.monotonic() + 1.0
+            snapshot = tracker.get()
+            while snapshot.sequence < 1 and time.monotonic() < deadline:
+                time.sleep(0.01)
+                snapshot = tracker.get()
+            self.assertGreaterEqual(snapshot.sequence, 1)
+            self.assertGreater(snapshot.frame_sequence, 10)
+            np.testing.assert_allclose(hamer_cam_t(snapshot.result), [0, 0, 1])
+        finally:
+            tracker.stop()
 
     def test_only_numpad_keys_are_accepted(self):
         self.assertTrue(app.ACCEPTED_NUMPAD_KEYS)
@@ -276,6 +693,104 @@ class KeyboardSim2RealTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             hardware.set_max_joint_speed(STRICT_20_PERCENT_LIMIT_DEG_S)
 
+    def test_live_servo_stream_runs_independently_at_fixed_rate(self):
+        ready = RobotFeedback(
+            received_at=time.monotonic(),
+            joints_deg=np.zeros(6),
+            joint_speeds_deg_s=np.zeros(6),
+            robot_mode=5,
+            enabled=True,
+            error=False,
+        )
+
+        class Feedback:
+            def require_fresh(self):
+                return ready
+
+            def close(self):
+                pass
+
+        class Move:
+            def __init__(self):
+                self.command_times = []
+
+            def ServoJ(self, *joints, **parameters):
+                self.command_times.append(time.monotonic())
+                return "0,{},ServoJ(...);"
+
+            def close(self):
+                pass
+
+        hardware = LiveServoHardware("192.0.2.1", max_joint_speed_deg_s=3.0)
+        hardware.feedback = Feedback()
+        hardware.move = Move()
+        hardware._last_command_deg = np.zeros(6)
+        hardware._last_send_time = time.monotonic()
+        hardware.start_stream(np.full(6, 20.0))
+        deadline = time.monotonic() + 0.25
+        while len(hardware.move.command_times) < 3 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        command_times = hardware.move.command_times.copy()
+        hardware.close()
+
+        self.assertGreaterEqual(len(command_times), 3)
+        intervals = np.diff(command_times[:3])
+        self.assertTrue(np.all(intervals >= LIVE_SERVO_PERIOD_S * 0.75))
+        self.assertTrue(np.all(intervals <= LIVE_SERVO_PERIOD_S * 1.75))
+
+    def test_live_servo_smooths_discrete_joint_targets_before_limiting(self):
+        ready = RobotFeedback(
+            received_at=0.0,
+            joints_deg=np.zeros(6),
+            joint_speeds_deg_s=np.zeros(6),
+            robot_mode=5,
+            enabled=True,
+            error=False,
+        )
+
+        class Feedback:
+            def require_fresh(self):
+                return ready
+
+        class Move:
+            def ServoJ(self, *joints, **parameters):
+                return "0,{},ServoJ(...);"
+
+        hardware = LiveServoHardware(
+            "192.0.2.1",
+            max_joint_speed_deg_s=18.0,
+            max_tracking_error_deg=100.0,
+        )
+        hardware.feedback = Feedback()
+        hardware.move = Move()
+        hardware._last_command_deg = np.zeros(6)
+        hardware._filtered_target_deg = np.zeros(6)
+        hardware._previous_requested_deg = np.zeros(6)
+        hardware._last_send_time = 0.0
+
+        requested = np.full(6, 0.015)
+        first = hardware.send_if_due(requested, now=10.0)
+        np.testing.assert_allclose(
+            first,
+            requested * LIVE_TARGET_FILTER_SLOW_ALPHA,
+        )
+        self.assertAlmostEqual(
+            hardware.last_target_filter_alpha,
+            LIVE_TARGET_FILTER_SLOW_ALPHA,
+        )
+        second_request = np.full(6, 0.60)
+        second = hardware.send_if_due(
+            second_request,
+            now=10.0 + LIVE_SERVO_PERIOD_S + 1e-6,
+        )
+        self.assertTrue(np.all(second > first))
+        self.assertTrue(np.all(second < second_request))
+        self.assertAlmostEqual(
+            hardware.last_target_filter_alpha,
+            LIVE_TARGET_FILTER_FAST_ALPHA,
+        )
+        np.testing.assert_allclose(hardware.latest_command_deg(), second)
+
     @patch("cr3_sim2real.hardware.DobotApiMove")
     @patch("cr3_sim2real.hardware.DobotApiDashboard")
     def test_live_servo_reuses_gui_feedback_without_closing_it(
@@ -405,6 +920,32 @@ class KeyboardSim2RealTests(unittest.TestCase):
             moved, np.full(6, 3.0 * LIVE_SERVO_PERIOD_S)
         )
 
+    def test_live_servo_stops_on_excessive_tracking_error(self):
+        lagging = RobotFeedback(
+            received_at=0.0,
+            joints_deg=np.zeros(6),
+            joint_speeds_deg_s=np.zeros(6),
+            robot_mode=5,
+            enabled=True,
+            error=False,
+        )
+
+        class Feedback:
+            def require_fresh(self):
+                return lagging
+
+        hardware = LiveServoHardware(
+            "192.0.2.1",
+            max_joint_speed_deg_s=3.0,
+            max_tracking_error_deg=5.0,
+        )
+        hardware.feedback = Feedback()
+        hardware.move = object()
+        hardware._last_command_deg = np.full(6, 6.0)
+        hardware._last_send_time = 0.0
+        with self.assertRaisesRegex(RuntimeError, "tracking error"):
+            hardware.send_if_due(np.full(6, 7.0), now=1.0)
+
     def test_motion_ready_requires_enabled_error_free_robot(self):
         good = RobotFeedback(
             received_at=0.0,
@@ -523,6 +1064,12 @@ class KeyboardSim2RealTests(unittest.TestCase):
         descriptions = gui.describe_alarm_groups(groups)
         self.assertTrue(any("控制器 [16]" in item for item in descriptions))
         self.assertTrue(any("伺服 J1 [2]" in item for item in descriptions))
+        english = gui.describe_alarm_groups(groups, "en")
+        self.assertTrue(any("Controller [16]" in item for item in english))
+        self.assertTrue(any("Servo J1 [2]" in item for item in english))
+        self.assertFalse(
+            any("\u3400" <= char <= "\u9fff" for item in english for char in item)
+        )
 
     @patch("cr3_sim2real.hardware.DobotApiDashboard")
     def test_get_error_ids_rejects_malformed_payload(self, dashboard_class):
@@ -564,7 +1111,7 @@ class KeyboardSim2RealTests(unittest.TestCase):
         reply = disable_robot("192.0.2.1", feedback=Feedback())
         self.assertIn("verified enable_status=0", reply)
 
-    def test_playback_waits_on_feedback_without_calling_sync(self):
+    def test_playback_streams_servoj_and_only_waits_at_final_target(self):
         target = np.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
         arrived = RobotFeedback(
             received_at=0.0,
@@ -603,16 +1150,23 @@ class KeyboardSim2RealTests(unittest.TestCase):
             def __init__(self):
                 self.commands = []
 
-            def JointMovJ(self, *args):
-                self.commands.append(args)
-                return "0,{},JointMovJ(...);"
+            def ServoJ(self, *args, **kwargs):
+                self.commands.append((args, kwargs))
+                return "0,{},ServoJ(...);"
 
         hardware = PlaybackHardware("192.0.2.1", 10, 5)
         hardware.feedback = StaticFeedback()
         hardware.dashboard = Dashboard(hardware.feedback)
         hardware.move = MoveWithoutSync()
-        hardware.execute([target])
-        self.assertEqual(len(hardware.move.commands), 1)
+        hardware._last_command_deg = target.copy()
+        hardware.execute(
+            [
+                (0.0, target),
+                (0.001, target),
+                (0.002, target),
+            ]
+        )
+        self.assertEqual(len(hardware.move.commands), 3)
         self.assertEqual(hardware.dashboard.continue_calls, 1)
 
     def test_joint_target_requires_position_and_stopped_speed(self):
@@ -639,6 +1193,40 @@ class KeyboardSim2RealTests(unittest.TestCase):
                 target,
             )
         )
+
+    def test_live_home_stream_uses_limiter_until_feedback_reaches_target(self):
+        target = np.ones(6)
+
+        class Feedback:
+            def __init__(self):
+                self.index = 0
+
+            def require_fresh(self):
+                self.index += 1
+                reached = self.index >= 3
+                return RobotFeedback(
+                    received_at=time.monotonic(),
+                    joints_deg=target.copy() if reached else np.zeros(6),
+                    joint_speeds_deg_s=np.zeros(6),
+                    robot_mode=5,
+                    enabled=True,
+                    error=False,
+                )
+
+        class Hardware:
+            def __init__(self):
+                self.feedback = Feedback()
+                self.targets = []
+
+            def send_if_due(self, requested):
+                self.targets.append(np.asarray(requested).copy())
+                return self.targets[-1]
+
+        hardware = Hardware()
+        reached = stream_live_target_until_reached(hardware, target, timeout=1.0)
+        np.testing.assert_allclose(reached.joints_deg, target)
+        self.assertEqual(len(hardware.targets), 2)
+        np.testing.assert_allclose(hardware.targets[0], target)
         self.assertFalse(
             joint_target_reached(
                 RobotFeedback(
@@ -692,6 +1280,9 @@ class KeyboardSim2RealTests(unittest.TestCase):
         self.assertTrue(commands)
         self.assertTrue(all("SpeedJ=10" in command for command in commands))
         self.assertTrue(all("AccJ=10" in command for command in commands))
+        servo_commands = build_servoj_dry_run(recorder.points, sample_period=0.03)
+        self.assertEqual(len(servo_commands), 3)
+        self.assertTrue(all("ServoJ(" in command for command in servo_commands))
 
         with tempfile.TemporaryDirectory() as directory:
             path = recorder.save_json(Path(directory))
@@ -710,6 +1301,45 @@ class KeyboardSim2RealTests(unittest.TestCase):
         self.assertEqual(len(selected), 2)
         np.testing.assert_allclose(selected[0].q, q0)
         np.testing.assert_allclose(selected[1].q, q1)
+
+    def test_servoj_resampling_preserves_timing_and_interpolates(self):
+        points = [
+            TrajectoryPoint(3.0, np.zeros(6), np.zeros(3)),
+            TrajectoryPoint(3.1, np.ones(6), np.ones(3)),
+        ]
+        samples = resample_joint_trajectory(points, sample_period=0.03)
+        np.testing.assert_allclose(
+            [point.time for point in samples],
+            [0.0, 0.03, 0.06, 0.09, 0.10],
+        )
+        np.testing.assert_allclose(samples[1].q, np.full(6, 0.3))
+        np.testing.assert_allclose(samples[-1].q, np.ones(6))
+
+    def test_hamer_real_prototype_only_plans_rate_limited_commands(self):
+        feedback = RobotFeedback(
+            received_at=0.0,
+            joints_deg=np.zeros(6),
+            joint_speeds_deg_s=np.zeros(6),
+            robot_mode=5,
+            enabled=True,
+            error=False,
+        )
+        preview = HamerRealCommandPreview(
+            HamerRealSafetyConfig(
+                max_joint_speed_deg_s=5.0,
+                hand_watchdog_s=0.5,
+            )
+        )
+        self.assertEqual(preview.arm(np.zeros(6), feedback, now=1.0), 0.0)
+        plan = preview.plan(
+            np.deg2rad(np.full(6, 10.0)),
+            feedback,
+            now=1.1,
+        )
+        np.testing.assert_allclose(plan.requested_deg, np.full(6, 10.0))
+        np.testing.assert_allclose(plan.planned_deg, np.full(6, 0.5))
+        with self.assertRaisesRegex(RuntimeError, "stale"):
+            preview.watchdog(feedback, now=1.7)
 
     def test_safety_rejects_nonfinite_and_large_jump(self):
         points = [

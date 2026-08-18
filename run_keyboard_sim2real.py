@@ -24,8 +24,10 @@ from cr3_sim2real.joint_mapping import (
     sim_rad_to_real_deg,
 )
 from cr3_sim2real.hardware import (
+    CR3_MAX_JOINT_SPEED_DEG_S,
     DEFAULT_LIVE_JOINT_SPEED_DEG_S,
     FeedbackReceiver,
+    LIVE_SERVO_PERIOD_S,
     LiveServoHardware,
     PlaybackHardware,
     STRICT_20_PERCENT_LIMIT_DEG_S,
@@ -33,8 +35,8 @@ from cr3_sim2real.hardware import (
 )
 from cr3_sim2real.trajectory import (
     TrajectoryRecorder,
-    build_jointmovj_dry_run,
-    downsample_points,
+    build_servoj_dry_run,
+    resample_joint_trajectory,
     validate_trajectory,
 )
 
@@ -162,7 +164,7 @@ def print_review(recorder: TrajectoryRecorder, saved_path: Path | None) -> None:
     if saved_path is not None:
         print(f"Saved: {saved_path}")
     print("Trajectory has NOT been sent to the real robot.")
-    print("Numpad * = safety check + JointMovJ dry run")
+    print("Numpad * = safety check + continuous ServoJ dry run")
     print("=" * 64)
 
 
@@ -180,20 +182,25 @@ def dry_run_review(
         print("No command has been sent to the real robot.")
         return False
 
-    commands = build_jointmovj_dry_run(
+    commands = build_servoj_dry_run(
         recorder.points,
-        speed_percent=speed_percent,
-        acceleration_percent=acceleration_percent,
+        sample_period=LIVE_SERVO_PERIOD_S,
     )
     print("\n" + "=" * 64)
     print("SAFETY CHECK PASSED — DRY RUN ONLY")
     print(f"Recorded samples: {len(recorder.points)}")
-    print(f"Downsampled JointMovJ waypoints: {len(commands)}")
-    print(f"SpeedJ={speed_percent}%  AccJ={acceleration_percent}% (both <20%)")
+    print(
+        f"Continuous ServoJ samples: {len(commands)} at "
+        f"{1 / LIVE_SERVO_PERIOD_S:.1f} Hz"
+    )
+    print(
+        f"Host joint speed cap={CR3_MAX_JOINT_SPEED_DEG_S * speed_percent / 100.0:.1f} deg/s  "
+        f"AccJ={acceleration_percent}% reserved (ServoJ does not use AccJ)"
+    )
     for index, command in enumerate(commands[:5], start=1):
         print(f"  {index:02d}: {command}")
     if len(commands) > 5:
-        print(f"  ... {len(commands) - 5} more waypoints")
+        print(f"  ... {len(commands) - 5} more ServoJ samples")
     if not MAPPING_CALIBRATED:
         print("REAL EXECUTION LOCKED: joint sign/offset mapping is UNCALIBRATED.")
     print("No socket was opened. No command was sent to the real robot.")
@@ -235,9 +242,14 @@ def execute_real_trajectory(
                 f"Real start pose differs by {start_error:.3f} deg; "
                 f"limit is {REAL_START_TOLERANCE_DEG:.3f} deg"
             )
-        waypoints = downsample_points(recorder.points, minimum_period=0.25)
-        real_waypoints = [sim_rad_to_real_deg(point.q) for point in waypoints[1:]]
-        hardware.execute(real_waypoints, stop_event=stop_event)
+        samples = resample_joint_trajectory(
+            recorder.points,
+            sample_period=LIVE_SERVO_PERIOD_S,
+        )
+        real_stream = [
+            (point.time, sim_rad_to_real_deg(point.q)) for point in samples
+        ]
+        hardware.execute(real_stream, stop_event=stop_event)
     finally:
         hardware.close()
 
@@ -250,7 +262,7 @@ def main() -> None:
         "--mode",
         choices=("record", "live"),
         default="record",
-        help="record=review then JointMovJ; live=33 Hz guarded ServoJ sync",
+        help="record=review then continuous ServoJ playback; live=33 Hz guarded ServoJ sync",
     )
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
@@ -450,7 +462,7 @@ def main() -> None:
                                 except Exception as exc:
                                     print(f"\nREAL EXECUTION ABORTED: {exc}")
                                     print(
-                                        "Remaining waypoints were not sent. "
+                                        "Remaining ServoJ samples were not sent. "
                                         "MuJoCo remains open for review."
                                     )
                             else:

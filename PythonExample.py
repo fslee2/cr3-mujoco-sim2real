@@ -1,13 +1,44 @@
+"""
+==============================================================================
+ Dobot 越疆机器人 Python API 示例脚本
+==============================================================================
+
+此脚本演示如何通过 TCP/IP 协议与越疆(Dobot)机器人控制器通信，涵盖了以下内容：
+
+1. 建立连接 —— 通过 Dashboard(29999)、Move(30003)、Feed(30004) 三个端口连接机器人
+2. API 指令调用 —— 包含 20+ 常用指令的示例，分为两类：
+   - dashboard 指令：机器人状态控制(使能/下使能)、运动学正逆解、Modbus、IO 等
+   - move 指令：直线运动(MovL)、圆弧(Arc)、整圆(Circle3)、点动(MoveJog) 等
+3. PARAMS 标志位 —— 用于控制指令调用时是否携带可选参数
+   - PARAMS=0：调用指令的"基本参数"版本（必选参数）
+   - PARAMS=1：调用指令的"扩展参数"版本（必选参数 + 可选参数）
+
+端口说明：
+  - 29999：Dashboard 端口，用于下发控制指令（使能、复位、运动学解算等）
+  - 30003：Move 端口，用于下发运动指令（MovL、MovJ、Arc 等）
+  - 30004：Feed 端口，用于接收机器人实时反馈数据（位姿、关节角等）
+==============================================================================
+"""
+
 from dobot_api import DobotApiDashboard, DobotApi, DobotApiMove, MyType
 from time import sleep
 
-PARAMS=0
+# PARAMS 标志位：0 = 仅使用必选参数调用指令；非0 = 携带可选参数调用指令
+PARAMS = 0
+
 def connect_robot():
+    """连接机器人控制器，返回 (dashboard, move, feed) 三个通信对象。
+
+    Returns:
+        dashboard (DobotApiDashboard): 控制指令端口 (port 29999)
+        move (DobotApiMove): 运动指令端口 (port 30003)
+        feed (DobotApi): 实时反馈数据端口 (port 30004)
+    """
     try:
-        ip = "192.168.5.1"
-        dashboard_p = 29999
-        move_p = 30003
-        feed_p = 30004
+        ip = "192.168.5.1"          # 机器人控制器 IP 地址
+        dashboard_p = 29999          # Dashboard 指令端口
+        move_p = 30003               # 运动指令端口
+        feed_p = 30004               # 实时反馈端口
         print("正在建立连接...")
         dashboard = DobotApiDashboard(ip, dashboard_p)
         move = DobotApiMove(ip, move_p)
@@ -20,38 +51,25 @@ def connect_robot():
 
 if __name__ == '__main__':
     dashboard, move, feed = connect_robot()
-   
-    """
-    ************************************
-    ************************************
-        if PARAMS  条件编译 指令是否有参数
-            0  指令不含参数
-            1   指令含参数
-            
-        包括以下指令的例子：
-            EnableRobot
-            DisableRobot
-            DO
-            AccJ
-            SetArmOrientation
-            RunScript
-            GetTraceStartPose
-            PositiveSolution
-            InverseSolution
-            GetPose
-            ModbusCreate
-            GetHoldRegs
-            DOGroup
-            SetCollideDrag
-            SetTerminal485
-            MovL
-            MovLIO
-            MoveJog
-            StartTrace
-            RelMovJUser
-            Circle3
-    """
-    
+
+    # =====================================================================
+    # 以下为各 API 指令的调用示例
+    #
+    # 指令根据 PARAMS 标志位不同，可携带不同数量的参数：
+    #   - PARAMS=0：if 分支，只传必选参数
+    #   - PARAMS=1：else 分支，传必选 + 可选参数（User/Tool/SpeedL/AccL/CP 等）
+    #
+    # 分类：
+    #   - [控制类] EnableRobot / DisableRobot / DO / DOGroup
+    #   - [运动学] PositiveSolution(正解) / InverseSolution(逆解) / GetPose
+    #   - [运动类] MovL(直线) / Arc(圆弧) / Circle3(整圆) / MovLIO / MoveJog(点动)
+    #     / RelMovJUser(用户坐标相对运动) / StartTrace(轨迹拟合)
+    #   - [配置类] AccJ(关节加速度) / SetArmOrientation(手系) / SetCollideDrag(拖拽)
+    #     / SetTerminal485(末端485)
+    #   - [通信类] ModbusCreate / GetHoldRegs
+    #   - [脚本类] RunScript / GetTraceStartPose
+    # =====================================================================
+
     """
     ************************************
     ************************************
@@ -72,8 +90,8 @@ if __name__ == '__main__':
     """
     ************************************
     ************************************
-     * 指令：DisableRobotexit
-     * 功能：下使能机器人
+     * 指令：DisableRobot
+     * 功能：下使能机器人（关闭电机，机器人进入自由拖拽状态）
     """
     dashboard.DisableRobot()    #无参数
      
@@ -281,7 +299,7 @@ if __name__ == '__main__':
     ************************************
     ************************************
      * 指令： MovL
-     * 功能：功能：点到点运动，目标点位为笛卡尔点位
+     * 功能：直线运动，末端以直线轨迹移动到笛卡尔目标点位
     """
     if PARAMS:
         x=1.0
@@ -404,7 +422,8 @@ if __name__ == '__main__':
         toolparam="Tool=0"
         move.MoveJog(axisID, CoordType, userparam, toolparam)    
 
-    ##    发MoveJog()停止命令控制机器人停止运动
+    ##  发MoveJog()停止命令控制机器人停止运动
+    ##  注意：MoveJog() 不传参数则立即停止当前点动
     move.MoveJog()
     
     
@@ -424,6 +443,8 @@ if __name__ == '__main__':
      * 指令： RelMovJUser
      * 功能：沿用户坐标系进行相对运动指令，末端运动方式为关节运动。
     """
+    # RelMovJUser：沿用户坐标系相对关节运动
+    # 参数: offsetX, offsetY, offsetZ, offsetRx, offsetRy, offsetRz, User
     x=1.0
     y=1.0
     z=1.0
@@ -431,7 +452,7 @@ if __name__ == '__main__':
     ry=1.0
     rz=1.0
     User=1
-    move.RelMovJUser(x,y,z,rx,ry,rz,traceName)      
+    move.RelMovJUser(x, y, z, rx, ry, rz, User)      
     
 
     """

@@ -159,6 +159,88 @@ def downsample_points(
     return selected
 
 
+def resample_joint_trajectory(
+    points: list[TrajectoryPoint],
+    sample_period: float = 0.03,
+) -> list[TrajectoryPoint]:
+    """Linearly resample a recorded trajectory for continuous ServoJ streaming.
+
+    Returned timestamps always start at zero and include the exact final point.
+    The original recording is left untouched.
+    """
+    if not points:
+        return []
+    if not np.isfinite(sample_period) or sample_period <= 0.0:
+        raise ValueError("sample period must be positive and finite")
+
+    times = np.asarray([point.time for point in points], dtype=float)
+    joints = np.asarray([point.q for point in points], dtype=float)
+    tcp = np.asarray([point.tcp for point in points], dtype=float)
+    if joints.shape != (len(points), 6):
+        raise ValueError(f"joint data must have shape (N, 6), got {joints.shape}")
+    if tcp.ndim != 2 or tcp.shape[0] != len(points):
+        raise ValueError("TCP samples must have one fixed-size vector per point")
+    if (
+        not np.isfinite(times).all()
+        or not np.isfinite(joints).all()
+        or not np.isfinite(tcp).all()
+    ):
+        raise ValueError("trajectory contains NaN or Inf")
+    if len(times) > 1 and np.any(np.diff(times) <= 0.0):
+        raise ValueError("timestamps must increase strictly")
+
+    relative_times = times - times[0]
+    duration = float(relative_times[-1])
+    if duration <= 0.0:
+        return [
+            TrajectoryPoint(
+                time=0.0,
+                q=joints[0].copy(),
+                tcp=tcp[0].copy(),
+            )
+        ]
+
+    sample_times = np.arange(0.0, duration, sample_period, dtype=float)
+    if sample_times.size == 0 or duration - sample_times[-1] > 1e-9:
+        sample_times = np.append(sample_times, duration)
+    else:
+        sample_times[-1] = duration
+
+    joint_samples = np.column_stack(
+        [
+            np.interp(sample_times, relative_times, joints[:, axis])
+            for axis in range(6)
+        ]
+    )
+    tcp_samples = np.column_stack(
+        [
+            np.interp(sample_times, relative_times, tcp[:, axis])
+            for axis in range(tcp.shape[1])
+        ]
+    )
+    return [
+        TrajectoryPoint(time=float(sample_time), q=q.copy(), tcp=tcp_value.copy())
+        for sample_time, q, tcp_value in zip(sample_times, joint_samples, tcp_samples)
+    ]
+
+
+def build_servoj_dry_run(
+    points: list[TrajectoryPoint],
+    *,
+    sample_period: float = 0.03,
+) -> list[str]:
+    """Build a no-I/O preview of the continuous ServoJ command stream."""
+    commands: list[str] = []
+    for point in resample_joint_trajectory(points, sample_period=sample_period):
+        joints_deg = sim_rad_to_real_deg(point.q)
+        values = ",".join(f"{value:.6f}" for value in joints_deg)
+        commands.append(
+            f"t=+{point.time:.3f}s ServoJ({values},"
+            "t=0.100,lookahead_time=50,gain=500)"
+        )
+    return commands
+
+
 def build_jointmovj_dry_run(
     points: list[TrajectoryPoint],
     *,
