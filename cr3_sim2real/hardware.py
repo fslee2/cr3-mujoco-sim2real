@@ -23,7 +23,13 @@ STRICT_20_PERCENT_LIMIT_DEG_S = CR3_MAX_JOINT_SPEED_DEG_S * 0.20
 DEFAULT_LIVE_JOINT_SPEED_DEG_S = 18.0
 DEFAULT_LIVE_TRACKING_ERROR_DEG = 5.0
 LIVE_SERVO_PERIOD_S = 0.03
-LIVE_SERVO_T_S = 0.10
+# ServoJ motion time per point. Keep it modest so the arm does not lag too far
+# behind the command stream; smoothness is handled by lookahead blending below.
+LIVE_SERVO_T_S = 0.05
+# ServoJ lookahead (PID "D"-like damping). At the API default of 50 the arm
+# visibly runs point-to-point at 33 Hz; a larger value blends consecutive
+# commands into one continuous motion.
+LIVE_SERVO_LOOKAHEAD = 100.0
 # Adaptively smooth discrete IK targets before the strict velocity limiter.
 # Slow motion keeps enough smoothing to suppress steps; fast motion minimizes
 # added delay so the physical arm remains responsive.
@@ -616,7 +622,7 @@ class PlaybackHardware:
         reply = self.move.ServoJ(
             *planned,
             t=LIVE_SERVO_T_S,
-            lookahead_time=50,
+            lookahead_time=LIVE_SERVO_LOOKAHEAD,
             gain=500,
         )
         require_command_success("ServoJ", reply)
@@ -835,7 +841,7 @@ class LiveServoHardware:
             dt=control_dt,
         )
         servo_reply = self.move.ServoJ(
-            *planned, t=LIVE_SERVO_T_S, lookahead_time=50, gain=500
+            *planned, t=LIVE_SERVO_T_S, lookahead_time=LIVE_SERVO_LOOKAHEAD, gain=500
         )
         require_command_success("ServoJ", servo_reply)
         self.last_planned_speed_deg_s = float(

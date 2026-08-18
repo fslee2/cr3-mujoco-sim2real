@@ -988,6 +988,7 @@ class CR3ControlGUI:
         self.hamer_real_origin_after_sequence = 0
         self.quest_receiver: QuestHandReceiver | None = None
         self.quest_mapper = QuestWristMapper()
+        self.quest_orientation_target: np.ndarray | None = None
         self.quest_phase = "idle"
         self.quest_last_sequence = 0
         self.quest_last_wrist_received_at = 0.0
@@ -1056,8 +1057,8 @@ class CR3ControlGUI:
         self.quest_hand_var = tk.StringVar(value=args.quest_hand)
         self.quest_gain_var = tk.StringVar(value="1.0")
         self.quest_deadzone_mm_var = tk.StringVar(value="1.0")
-        self.quest_slow_alpha_var = tk.StringVar(value="0.30")
-        self.quest_fast_alpha_var = tk.StringVar(value="0.85")
+        self.quest_slow_alpha_var = tk.StringVar(value="0.60")
+        self.quest_fast_alpha_var = tk.StringVar(value="0.95")
         self.quest_cartesian_speed_var = tk.StringVar(
             value=f"{QUEST_DEFAULT_CARTESIAN_SPEED_M_S:g}"
         )
@@ -4075,6 +4076,7 @@ class CR3ControlGUI:
             receiver.stop()
         if clear_origin:
             self.quest_mapper.clear_origin()
+            self.quest_orientation_target = None
         self.quest_phase = "idle"
         self.quest_last_sequence = 0
         self._set_button_text(self.quest_button, "启动 Quest 接收")
@@ -4098,6 +4100,9 @@ class CR3ControlGUI:
         self.q_target = current_q
         mujoco.mj_forward(self.model, self.data)
         ee_pos = self.data.xpos[self.end_effector_id].copy()
+        self.quest_orientation_target = self.data.xmat[
+            self.end_effector_id
+        ].reshape(3, 3).copy()
         assert snapshot.wrist_position is not None
         self.quest_mapper.calibrate(
             snapshot.wrist_position,
@@ -4143,9 +4148,6 @@ class CR3ControlGUI:
                 f"{self.quest_hand_var.get()} 腕部数据"
             )
             return
-        if snapshot.wrist_sequence == self.quest_last_sequence:
-            return
-        previous_wrist_time = self.quest_last_wrist_received_at
         self.quest_last_sequence = snapshot.wrist_sequence
         self.quest_last_wrist_received_at = snapshot.received_at
         assert snapshot.wrist_position is not None
@@ -4176,30 +4178,35 @@ class CR3ControlGUI:
         target_pos = self.quest_mapper.target_pos(
             snapshot.wrist_position,
             timestamp=snapshot.received_at,
+            now=now,
         )
         ee_pos = self.data.xpos[self.end_effector_id].copy()
         position_error = target_pos - ee_pos
-        control_dt = (
-            snapshot.received_at - previous_wrist_time
-            if previous_wrist_time > 0.0
-            else 1.0 / QUEST_CONTROL_RATE_HZ
-        )
+        # Use a fixed control period: the mapper already predicts between
+        # packets, so reusing the jittery packet interval here would restore
+        # variable-sized steps and the visible stutter.
+        control_dt = 1.0 / QUEST_CONTROL_RATE_HZ
         position_error = limit_cartesian_tracking_step(
             position_error,
             max_speed_m_s=float(self.quest_cartesian_speed_var.get()),
-            dt=max(control_dt, 1.0 / 240.0),
+            dt=control_dt,
         )
         twist = np.zeros(6)
         twist[:3] = position_error
         current_q = self.data.qpos[self.arm_qpos_indices].copy()
-        self.q_target = core.apply_cartesian_increment(
+        if self.quest_orientation_target is None:
+            self.quest_orientation_target = self.data.xmat[
+                self.end_effector_id
+            ].reshape(3, 3).copy()
+        self.q_target = core.apply_position_increment_holding_orientation(
             self.model,
             self.data,
             self.end_effector_id,
             self.arm_dof_indices,
             self.arm_joint_ids,
-            current_q,
-            twist,
+            self.q_target,
+            position_error,
+            self.quest_orientation_target,
         )
         assert self.quest_mapper.ee_origin is not None
         delta_mm = np.round(
