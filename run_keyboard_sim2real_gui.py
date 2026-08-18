@@ -74,6 +74,9 @@ HAMER_REAL_HOME_SPEED_DEG_S = 5.0
 MANUAL_REAL_HOME_SPEED_DEG_S = 5.0
 HAMER_REAL_HAND_WATCHDOG_S = 5.0
 HAMER_REAL_CONFIRMATION_WINDOW_S = 30.0
+# The two CR3 controllers on the project's robot LAN.  Keep these as
+# selectable defaults while still allowing a manually entered IP.
+KNOWN_ROBOT_IPS = ("192.168.5.11", "192.168.5.12")
 DEFAULT_HAMER_ORIGIN_VIDEO = (
     core.ROOT.parent.parent / "mujoco_ws" / "hand_sequence.avi"
 )
@@ -966,7 +969,9 @@ class CR3ControlGUI:
         self.monitor: FeedbackReceiver | None = None
         self.connected_robot_ip: str | None = None
         self.feedback_connecting_ip: str | None = None
-        self.robot_ip_history: list[str] = []
+        self.robot_ip_history: list[str] = list(
+            dict.fromkeys((args.robot_ip, *KNOWN_ROBOT_IPS))
+        )
         self.live_hardware: LiveServoHardware | None = None
         self.live_starting = False
         self.teach_active = False
@@ -1349,7 +1354,7 @@ class CR3ControlGUI:
         self.robot_ip_combo = ttk.Combobox(
             connection,
             textvariable=self.robot_ip_var,
-            values=(self.args.robot_ip,),
+            values=tuple(self.robot_ip_history),
             width=22,
             state="normal",
         )
