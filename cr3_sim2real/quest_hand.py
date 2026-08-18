@@ -29,6 +29,33 @@ R_UNITY_TO_ROBOT = np.array(
     dtype=float,
 )
 
+
+def quest_quaternion_to_robot_rotation(quaternion: np.ndarray) -> np.ndarray:
+    """Convert a Quest/Unity ``(x, y, z, w)`` quaternion to robot axes.
+
+    The Quest streamer publishes rotations in Unity's left-handed frame.  The
+    same basis change used for wrist positions is applied by conjugation so
+    that the returned matrix is a proper rotation in the CR3/MuJoCo frame.
+    This is intentionally a small, stateless helper: callers decide how to
+    calibrate the wrist-to-tool frame at an origin.
+    """
+    values = np.asarray(quaternion, dtype=float).reshape(-1)
+    if values.size != 4 or not np.isfinite(values).all():
+        raise ValueError("Quest wrist quaternion must contain four finite values")
+    norm = float(np.linalg.norm(values))
+    if norm <= 1e-12:
+        raise ValueError("Quest wrist quaternion has zero length")
+    x, y, z, w = values / norm
+    r_unity = np.array(
+        [
+            [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - w * z), 2.0 * (x * z + w * y)],
+            [2.0 * (x * y + w * z), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - w * x)],
+            [2.0 * (x * z - w * y), 2.0 * (y * z + w * x), 1.0 - 2.0 * (x * x + y * y)],
+        ],
+        dtype=float,
+    )
+    return R_UNITY_TO_ROBOT @ r_unity @ R_UNITY_TO_ROBOT.T
+
 _FRAME_RE = re.compile(r"\bf\s*=\s*(\d+)", re.IGNORECASE)
 _TIMESTAMP_RE = re.compile(r"\bt\s*=\s*(\d+)", re.IGNORECASE)
 

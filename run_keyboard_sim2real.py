@@ -54,6 +54,8 @@ ROTATION_STEP_RAD = np.deg2rad(2.0)
 SIM_MAX_JOINT_SPEED_RAD_S = np.deg2rad(60.0)
 MAX_RESOLVED_JOINT_STEP_RAD = np.deg2rad(5.0)
 IK_DAMPING = 0.1
+ORIENTATION_TASK_WEIGHT = 0.75
+MAX_ORIENTATION_ERROR_RAD = np.deg2rad(12.0)
 REAL_START_TOLERANCE_DEG = 3.0
 CONTROL_RATE_HZ = 100.0
 RECORD_RATE_HZ = 50.0
@@ -146,6 +148,82 @@ def apply_cartesian_increment(
         dq *= MAX_RESOLVED_JOINT_STEP_RAD / dq_norm
 
     result = q_target + dq
+    return np.clip(
+        result,
+        model.jnt_range[arm_joint_ids, 0],
+        model.jnt_range[arm_joint_ids, 1],
+    )
+
+
+def rotation_error_vector(
+    target_rotation: np.ndarray,
+    current_rotation: np.ndarray,
+    *,
+    max_angle_rad: float = MAX_ORIENTATION_ERROR_RAD,
+) -> np.ndarray:
+    """Return a bounded world-frame SO(3) error vector in radians."""
+    target = np.asarray(target_rotation, dtype=float).reshape(3, 3)
+    current = np.asarray(current_rotation, dtype=float).reshape(3, 3)
+    relative = target @ current.T
+    skew = 0.5 * (relative - relative.T)
+    vee = np.array([skew[2, 1], skew[0, 2], skew[1, 0]], dtype=float)
+    cosine = float(np.clip((np.trace(relative) - 1.0) * 0.5, -1.0, 1.0))
+    angle = float(np.arccos(cosine))
+    if angle < 1e-7:
+        error = vee
+    else:
+        sine = float(np.sin(angle))
+        if abs(sine) > 1e-7:
+            error = vee * (angle / sine)
+        else:
+            # The 180-degree case is rare for hand tracking; use the most
+            # stable diagonal axis available rather than emitting NaNs.
+            axis = np.sqrt(np.maximum(np.diag(relative) + 1.0, 0.0) * 0.5)
+            axis[int(np.argmax(axis))] = max(axis[int(np.argmax(axis))], 1e-7)
+            error = axis * angle
+    norm = float(np.linalg.norm(error))
+    if norm > max_angle_rad > 0.0:
+        error *= max_angle_rad / norm
+    return error
+
+
+def apply_cartesian_pose_increment(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    end_effector_id: int,
+    arm_dof_indices: np.ndarray,
+    arm_joint_ids: np.ndarray,
+    current_q: np.ndarray,
+    position_delta: np.ndarray,
+    target_rotation: np.ndarray,
+    *,
+    orientation_weight: float = ORIENTATION_TASK_WEIGHT,
+) -> np.ndarray:
+    """One resolved-rate XYZ+orientation step from the current simulation pose.
+
+    This is an opt-in Quest experiment.  ``current_q`` is deliberately the
+    current MuJoCo pose, not the previous target, so the orientation hold does
+    not accumulate stale IK error.  The normal XYZ-only helper is unchanged.
+    """
+    jacp = np.zeros((3, model.nv))
+    jacr = np.zeros((3, model.nv))
+    mujoco.mj_jacBody(model, data, jacp, jacr, end_effector_id)
+    current_rotation = np.asarray(data.xmat[end_effector_id], dtype=float).reshape(3, 3)
+    orientation_error = rotation_error_vector(target_rotation, current_rotation)
+    weight = max(float(orientation_weight), 0.0)
+    jacobian = np.vstack(
+        [jacp[:, arm_dof_indices], weight * jacr[:, arm_dof_indices]]
+    )
+    task = np.concatenate(
+        [np.asarray(position_delta, dtype=float).reshape(3), weight * orientation_error]
+    )
+    dq = jacobian.T @ np.linalg.solve(
+        jacobian @ jacobian.T + IK_DAMPING * np.eye(6), task
+    )
+    dq_norm = float(np.linalg.norm(dq))
+    if dq_norm > MAX_RESOLVED_JOINT_STEP_RAD:
+        dq *= MAX_RESOLVED_JOINT_STEP_RAD / dq_norm
+    result = np.asarray(current_q, dtype=float).reshape(-1) + dq
     return np.clip(
         result,
         model.jnt_range[arm_joint_ids, 0],

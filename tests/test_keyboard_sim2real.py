@@ -53,6 +53,7 @@ from cr3_sim2real.quest_hand import (
     QuestHandReceiver,
     QuestWristMapper,
     parse_quest_line,
+    quest_quaternion_to_robot_rotation,
 )
 from cr3_sim2real.trajectory import (
     TrajectoryPoint,
@@ -143,6 +144,28 @@ class KeyboardSim2RealTests(unittest.TestCase):
         self.assertLess(slow_alpha, fast_alpha)
         self.assertLess(slow_target[0] / 0.0001, fast_target[0] / 0.01)
         self.assertAlmostEqual(mapper.last_sample_hz, 60.0, places=5)
+
+    def test_quest_quaternion_conversion_preserves_identity_and_axes(self):
+        identity = quest_quaternion_to_robot_rotation([0.0, 0.0, 0.0, 1.0])
+        np.testing.assert_allclose(identity, np.eye(3), atol=1e-12)
+        # A Unity +90° yaw about its up axis becomes the corresponding
+        # conjugated rotation in the CR3 frame, with no scale or reflection.
+        half = np.sin(np.pi / 4.0)
+        converted = quest_quaternion_to_robot_rotation(
+            [0.0, half, 0.0, np.cos(np.pi / 4.0)]
+        )
+        np.testing.assert_allclose(converted.T @ converted, np.eye(3), atol=1e-12)
+        self.assertAlmostEqual(float(np.linalg.det(converted)), 1.0, places=12)
+
+    def test_rotation_error_vector_is_bounded(self):
+        angle = np.deg2rad(90.0)
+        target = np.array(
+            [[np.cos(angle), -np.sin(angle), 0.0],
+             [np.sin(angle), np.cos(angle), 0.0],
+             [0.0, 0.0, 1.0]]
+        )
+        error = app.rotation_error_vector(target, np.eye(3), max_angle_rad=np.deg2rad(30.0))
+        self.assertAlmostEqual(float(np.linalg.norm(error)), np.deg2rad(30.0), places=7)
 
     def test_cartesian_tracking_limit_uses_speed_and_caps_stale_dt(self):
         limited = gui.limit_cartesian_tracking_step(
