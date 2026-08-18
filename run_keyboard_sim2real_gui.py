@@ -2141,6 +2141,9 @@ class CR3ControlGUI:
             home_data.qvel[:] = 0.0
             mujoco.mj_forward(self.model, home_data)
             home_ee_pos = home_data.xpos[self.end_effector_id].copy()
+            self.quest_orientation_target = home_data.xmat[
+                self.end_effector_id
+            ].reshape(3, 3).copy()
             self.quest_mapper.reanchor_robot_origin(home_ee_pos)
             self.quest_status_var.set("Quest 腕部原点已保留 · Link6 基准已对齐 Home")
             self.log(
@@ -2255,6 +2258,10 @@ class CR3ControlGUI:
         self.manual_home_active = False
         self._set_button_text(self.real_home_button, "实机回 Home")
         home_ee = self._set_sim_home_now()
+        if self.quest_mapper.calibrated and hasattr(self, "data"):
+            self.quest_orientation_target = self.data.xmat[
+                self.end_effector_id
+            ].reshape(3, 3).copy()
         if self.hamer_mapper.calibrated:
             self.hamer_mapper.reanchor_robot_origin(home_ee)
         if self.quest_mapper.calibrated:
@@ -4191,9 +4198,6 @@ class CR3ControlGUI:
             max_speed_m_s=float(self.quest_cartesian_speed_var.get()),
             dt=control_dt,
         )
-        twist = np.zeros(6)
-        twist[:3] = position_error
-        current_q = self.data.qpos[self.arm_qpos_indices].copy()
         if self.quest_orientation_target is None:
             self.quest_orientation_target = self.data.xmat[
                 self.end_effector_id
@@ -4350,6 +4354,9 @@ class CR3ControlGUI:
         received_at: float,
     ) -> None:
         home_ee = self._set_sim_home_now()
+        self.quest_orientation_target = self.data.xmat[
+            self.end_effector_id
+        ].reshape(3, 3).copy()
         self.quest_mapper.calibrate(
             wrist_position,
             home_ee,
@@ -4439,6 +4446,9 @@ class CR3ControlGUI:
 
         assert snapshot.wrist_position is not None
         home_ee = self._set_sim_home_now()
+        self.quest_orientation_target = self.data.xmat[
+            self.end_effector_id
+        ].reshape(3, 3).copy()
         self.quest_mapper.calibrate(
             snapshot.wrist_position,
             home_ee,
