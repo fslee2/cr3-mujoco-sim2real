@@ -70,18 +70,10 @@ KEY_REPEAT_PERIOD_S = 0.05
 QUEST_CONTROL_RATE_HZ = 60.0
 QUEST_DEFAULT_CARTESIAN_SPEED_M_S = 0.80
 QUEST_MAX_CONTROL_DT_S = 0.05
-# Keep the default Quest path position-based and deterministic.  The
-# controller has no need to extrapolate a hand pose for the current UDP link;
-# a single fixed EMA is easier to tune than speed-dependent filtering.
-QUEST_DEFAULT_FILTER_ALPHA = 0.75
-QUEST_MAX_PREDICT_S = 0.0
 HAMER_REAL_HOME_SPEED_DEG_S = 5.0
 MANUAL_REAL_HOME_SPEED_DEG_S = 5.0
 HAMER_REAL_HAND_WATCHDOG_S = 5.0
 HAMER_REAL_CONFIRMATION_WINDOW_S = 30.0
-# The two CR3 controllers on the project's robot LAN.  Keep these as
-# selectable defaults while still allowing a manually entered IP.
-KNOWN_ROBOT_IPS = ("192.168.5.11", "192.168.5.12")
 DEFAULT_HAMER_ORIGIN_VIDEO = (
     core.ROOT.parent.parent / "mujoco_ws" / "hand_sequence.avi"
 )
@@ -974,9 +966,7 @@ class CR3ControlGUI:
         self.monitor: FeedbackReceiver | None = None
         self.connected_robot_ip: str | None = None
         self.feedback_connecting_ip: str | None = None
-        self.robot_ip_history: list[str] = list(
-            dict.fromkeys((args.robot_ip, *KNOWN_ROBOT_IPS))
-        )
+        self.robot_ip_history: list[str] = []
         self.live_hardware: LiveServoHardware | None = None
         self.live_starting = False
         self.teach_active = False
@@ -998,12 +988,10 @@ class CR3ControlGUI:
         self.hamer_real_origin_after_sequence = 0
         self.quest_receiver: QuestHandReceiver | None = None
         self.quest_mapper = QuestWristMapper()
-        self.quest_orientation_target: np.ndarray | None = None
         self.quest_phase = "idle"
         self.quest_last_sequence = 0
         self.quest_last_wrist_received_at = 0.0
         self.quest_next_poll = 0.0
-        self.quest_last_control_time = 0.0
         self.quest_last_wrist_received_at = 0.0
         self.quest_real_stage = "idle"
         self.quest_real_confirm_until = 0.0
@@ -1068,12 +1056,8 @@ class CR3ControlGUI:
         self.quest_hand_var = tk.StringVar(value=args.quest_hand)
         self.quest_gain_var = tk.StringVar(value="1.0")
         self.quest_deadzone_mm_var = tk.StringVar(value="1.0")
-        self.quest_slow_alpha_var = tk.StringVar(
-            value=f"{QUEST_DEFAULT_FILTER_ALPHA:g}"
-        )
-        self.quest_fast_alpha_var = tk.StringVar(
-            value=f"{QUEST_DEFAULT_FILTER_ALPHA:g}"
-        )
+        self.quest_slow_alpha_var = tk.StringVar(value="0.30")
+        self.quest_fast_alpha_var = tk.StringVar(value="0.85")
         self.quest_cartesian_speed_var = tk.StringVar(
             value=f"{QUEST_DEFAULT_CARTESIAN_SPEED_M_S:g}"
         )
@@ -1364,7 +1348,7 @@ class CR3ControlGUI:
         self.robot_ip_combo = ttk.Combobox(
             connection,
             textvariable=self.robot_ip_var,
-            values=tuple(self.robot_ip_history),
+            values=(self.args.robot_ip,),
             width=22,
             state="normal",
         )
@@ -2055,17 +2039,7 @@ class CR3ControlGUI:
         self.root.after(20, self._clear_keys_if_window_inactive)
 
     def _clear_keys_if_window_inactive(self) -> None:
-        # ttk.Combobox creates a transient ``popdown`` widget.  During its
-        # teardown Tk can return a focus path that no longer exists in
-        # ``root.children``; tkinter's focus_get() then raises KeyError while
-        # resolving that stale path.  Treat this short race as an unknown
-        # focus state and wait for the next FocusOut event instead of letting
-        # the periodic callback fail.
-        try:
-            focus = self.root.focus_get()
-        except (KeyError, tk.TclError):
-            return
-        if focus is None:
+        if self.root.focus_get() is None:
             self._clear_motion_keys()
             self.keyboard_status_var.set(self._tr("窗口失焦：运动键已清除"))
 
@@ -2166,9 +2140,6 @@ class CR3ControlGUI:
             home_data.qvel[:] = 0.0
             mujoco.mj_forward(self.model, home_data)
             home_ee_pos = home_data.xpos[self.end_effector_id].copy()
-            self.quest_orientation_target = home_data.xmat[
-                self.end_effector_id
-            ].reshape(3, 3).copy()
             self.quest_mapper.reanchor_robot_origin(home_ee_pos)
             self.quest_status_var.set("Quest 腕部原点已保留 · Link6 基准已对齐 Home")
             self.log(
@@ -2283,10 +2254,6 @@ class CR3ControlGUI:
         self.manual_home_active = False
         self._set_button_text(self.real_home_button, "实机回 Home")
         home_ee = self._set_sim_home_now()
-        if self.quest_mapper.calibrated and hasattr(self, "data"):
-            self.quest_orientation_target = self.data.xmat[
-                self.end_effector_id
-            ].reshape(3, 3).copy()
         if self.hamer_mapper.calibrated:
             self.hamer_mapper.reanchor_robot_origin(home_ee)
         if self.quest_mapper.calibrated:
@@ -4072,7 +4039,6 @@ class CR3ControlGUI:
                 ema_alpha=slow_alpha,
                 fast_ema_alpha=fast_alpha,
                 filter_reference_hz=QUEST_CONTROL_RATE_HZ,
-                max_predict_s=QUEST_MAX_PREDICT_S,
             )
             receiver = QuestHandReceiver(
                 protocol=self.quest_protocol_var.get(),
@@ -4088,7 +4054,6 @@ class CR3ControlGUI:
         self.quest_receiver = receiver
         self.quest_phase = "wait_origin"
         self.quest_last_sequence = 0
-        self.quest_last_control_time = 0.0
         self.quest_last_wrist_received_at = 0.0
         self._set_button_text(self.quest_button, "停止 Quest 接收")
         self.quest_status_var.set(
@@ -4110,10 +4075,8 @@ class CR3ControlGUI:
             receiver.stop()
         if clear_origin:
             self.quest_mapper.clear_origin()
-            self.quest_orientation_target = None
         self.quest_phase = "idle"
         self.quest_last_sequence = 0
-        self.quest_last_control_time = 0.0
         self._set_button_text(self.quest_button, "启动 Quest 接收")
         self.quest_status_var.set("Quest 未启动 · 仅控制 MuJoCo")
         if receiver is not None:
@@ -4135,9 +4098,6 @@ class CR3ControlGUI:
         self.q_target = current_q
         mujoco.mj_forward(self.model, self.data)
         ee_pos = self.data.xpos[self.end_effector_id].copy()
-        self.quest_orientation_target = self.data.xmat[
-            self.end_effector_id
-        ].reshape(3, 3).copy()
         assert snapshot.wrist_position is not None
         self.quest_mapper.calibrate(
             snapshot.wrist_position,
@@ -4146,7 +4106,6 @@ class CR3ControlGUI:
         )
         self.quest_phase = "live"
         self.quest_last_sequence = snapshot.wrist_sequence
-        self.quest_last_control_time = time.monotonic()
         self.quest_last_wrist_received_at = snapshot.received_at
         self.status_var.set("QUEST SIM ACTIVE")
         self.quest_status_var.set(
@@ -4184,9 +4143,13 @@ class CR3ControlGUI:
                 f"{self.quest_hand_var.get()} 腕部数据"
             )
             return
+        if snapshot.wrist_sequence == self.quest_last_sequence:
+            return
+        previous_wrist_time = self.quest_last_wrist_received_at
         self.quest_last_sequence = snapshot.wrist_sequence
         self.quest_last_wrist_received_at = snapshot.received_at
         assert snapshot.wrist_position is not None
+        assert snapshot.wrist_quaternion is not None
         self.quest_last_valid_wrist_at = snapshot.received_at
         if (
             self.quest_real_stage == "waiting_origin"
@@ -4213,40 +4176,30 @@ class CR3ControlGUI:
         target_pos = self.quest_mapper.target_pos(
             snapshot.wrist_position,
             timestamp=snapshot.received_at,
-            now=now,
         )
         ee_pos = self.data.xpos[self.end_effector_id].copy()
         position_error = target_pos - ee_pos
-        # Use the actual GUI control interval, capped for safety.  The old
-        # fixed 1/60 s assumption made the Cartesian limiter inconsistent with
-        # Tk scheduling and could turn occasional delayed callbacks into
-        # visible step changes.
-        if self.quest_last_control_time <= 0.0:
-            control_dt = 1.0 / QUEST_CONTROL_RATE_HZ
-        else:
-            control_dt = min(
-                max(now - self.quest_last_control_time, 1.0e-4),
-                QUEST_MAX_CONTROL_DT_S,
-            )
-        self.quest_last_control_time = now
+        control_dt = (
+            snapshot.received_at - previous_wrist_time
+            if previous_wrist_time > 0.0
+            else 1.0 / QUEST_CONTROL_RATE_HZ
+        )
         position_error = limit_cartesian_tracking_step(
             position_error,
             max_speed_m_s=float(self.quest_cartesian_speed_var.get()),
-            dt=control_dt,
+            dt=max(control_dt, 1.0 / 240.0),
         )
-        if self.quest_orientation_target is None:
-            self.quest_orientation_target = self.data.xmat[
-                self.end_effector_id
-            ].reshape(3, 3).copy()
-        self.q_target = core.apply_position_increment_holding_orientation(
+        twist = np.zeros(6)
+        twist[:3] = position_error
+        current_q = self.data.qpos[self.arm_qpos_indices].copy()
+        self.q_target = core.apply_cartesian_increment(
             self.model,
             self.data,
             self.end_effector_id,
             self.arm_dof_indices,
             self.arm_joint_ids,
-            self.q_target,
-            position_error,
-            self.quest_orientation_target,
+            current_q,
+            twist,
         )
         assert self.quest_mapper.ee_origin is not None
         delta_mm = np.round(
@@ -4390,9 +4343,6 @@ class CR3ControlGUI:
         received_at: float,
     ) -> None:
         home_ee = self._set_sim_home_now()
-        self.quest_orientation_target = self.data.xmat[
-            self.end_effector_id
-        ].reshape(3, 3).copy()
         self.quest_mapper.calibrate(
             wrist_position,
             home_ee,
@@ -4482,9 +4432,6 @@ class CR3ControlGUI:
 
         assert snapshot.wrist_position is not None
         home_ee = self._set_sim_home_now()
-        self.quest_orientation_target = self.data.xmat[
-            self.end_effector_id
-        ].reshape(3, 3).copy()
         self.quest_mapper.calibrate(
             snapshot.wrist_position,
             home_ee,

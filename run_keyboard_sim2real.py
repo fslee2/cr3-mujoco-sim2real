@@ -51,13 +51,8 @@ HOME_Q_RAD = np.array([0.0, 0.6072, -1.7223, -0.2949, 1.6134, 0.0])
 # SpeedJ/AccJ. These values only affect the MuJoCo preview.
 TRANSLATION_STEP_M = 0.010
 ROTATION_STEP_RAD = np.deg2rad(2.0)
-SIM_MAX_JOINT_SPEED_RAD_S = np.deg2rad(180.0)
+SIM_MAX_JOINT_SPEED_RAD_S = np.deg2rad(60.0)
 MAX_RESOLVED_JOINT_STEP_RAD = np.deg2rad(5.0)
-# Quest commands XYZ only, but keep the Link6 attitude captured at the
-# origin.  This prevents the redundant 6-DOF IK solve from redistributing
-# wrist joints on every sample while still ignoring Quest wrist rotation.
-MAX_ORIENTATION_HOLD_CORRECTION_RAD = np.deg2rad(2.0)
-ORIENTATION_HOLD_WEIGHT = 10.0
 IK_DAMPING = 0.1
 REAL_START_TOLERANCE_DEG = 3.0
 CONTROL_RATE_HZ = 100.0
@@ -151,69 +146,6 @@ def apply_cartesian_increment(
         dq *= MAX_RESOLVED_JOINT_STEP_RAD / dq_norm
 
     result = q_target + dq
-    return np.clip(
-        result,
-        model.jnt_range[arm_joint_ids, 0],
-        model.jnt_range[arm_joint_ids, 1],
-    )
-
-
-def apply_position_increment_holding_orientation(
-    model: mujoco.MjModel,
-    data: mujoco.MjData,
-    end_effector_id: int,
-    arm_dof_indices: np.ndarray,
-    arm_joint_ids: np.ndarray,
-    q_target: np.ndarray,
-    position_delta: np.ndarray,
-    target_rotation: np.ndarray,
-) -> np.ndarray:
-    """Resolve Quest XYZ motion while holding the origin Link6 attitude.
-
-    The Quest quaternion is deliberately not an input.  The orientation is
-    only a stabilizing constraint captured at the Quest origin, so position
-    control does not make the redundant wrist joints change their solution
-    from one sample to the next.
-    """
-    current_rotation = np.asarray(
-        data.xmat[end_effector_id], dtype=float
-    ).reshape(3, 3)
-    desired_rotation = np.asarray(target_rotation, dtype=float).reshape(3, 3)
-    rotation_error = desired_rotation @ current_rotation.T
-    angular_error = 0.5 * np.array(
-        [
-            rotation_error[2, 1] - rotation_error[1, 2],
-            rotation_error[0, 2] - rotation_error[2, 0],
-            rotation_error[1, 0] - rotation_error[0, 1],
-        ],
-        dtype=float,
-    )
-    angular_norm = float(np.linalg.norm(angular_error))
-    if angular_norm > MAX_ORIENTATION_HOLD_CORRECTION_RAD:
-        angular_error *= MAX_ORIENTATION_HOLD_CORRECTION_RAD / angular_norm
-
-    jacp = np.zeros((3, model.nv))
-    jacr = np.zeros((3, model.nv))
-    mujoco.mj_jacBody(model, data, jacp, jacr, end_effector_id)
-    jacobian = np.vstack(
-        [
-            jacp[:, arm_dof_indices],
-            ORIENTATION_HOLD_WEIGHT * jacr[:, arm_dof_indices],
-        ]
-    )
-    task = np.concatenate(
-        [
-            np.asarray(position_delta, dtype=float).reshape(3),
-            ORIENTATION_HOLD_WEIGHT * angular_error,
-        ]
-    )
-    dq = jacobian.T @ np.linalg.solve(
-        jacobian @ jacobian.T + IK_DAMPING * np.eye(6), task
-    )
-    dq_norm = float(np.linalg.norm(dq))
-    if dq_norm > MAX_RESOLVED_JOINT_STEP_RAD:
-        dq *= MAX_RESOLVED_JOINT_STEP_RAD / dq_norm
-    result = np.asarray(q_target, dtype=float) + dq
     return np.clip(
         result,
         model.jnt_range[arm_joint_ids, 0],

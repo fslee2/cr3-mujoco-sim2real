@@ -57,10 +57,7 @@ class QuestHandSnapshot:
 
     @property
     def has_wrist(self) -> bool:
-        # XYZ-only control does not need a wrist orientation.  Quaternion is
-        # still retained in the snapshot for future orientation modes, but a
-        # missing quaternion must not invalidate an otherwise good XYZ sample.
-        return self.wrist_position is not None
+        return self.wrist_position is not None and self.wrist_quaternion is not None
 
 
 def parse_quest_line(line: str) -> QuestPacket | None:
@@ -335,12 +332,6 @@ class QuestWristMapper:
         slow_speed_m_s: float = 0.02,
         fast_speed_m_s: float = 0.20,
         filter_reference_hz: float = 60.0,
-        # Position control is intentionally non-predictive by default.  A
-        # predictive lead is useful for latency compensation, but it makes a
-        # hand stop/reverse overshoot when UDP timing is irregular.  The GUI
-        # can opt in explicitly if a different transport needs it.
-        max_predict_s: float = 0.0,
-        velocity_alpha: float = 0.80,
     ) -> None:
         self.gain = float(gain)
         self.max_delta_m = float(max_delta_m)
@@ -354,25 +345,17 @@ class QuestWristMapper:
         self.slow_speed_m_s = float(slow_speed_m_s)
         self.fast_speed_m_s = float(fast_speed_m_s)
         self.filter_reference_hz = float(filter_reference_hz)
-        self.max_predict_s = float(max_predict_s)
-        self.velocity_alpha = float(velocity_alpha)
         if not 0.0 < self.ema_alpha <= self.fast_ema_alpha <= 1.0:
             raise ValueError("Quest filter alpha must satisfy 0 < slow <= fast <= 1")
         if not 0.0 <= self.slow_speed_m_s < self.fast_speed_m_s:
             raise ValueError("Quest filter speed thresholds are invalid")
         if self.filter_reference_hz <= 0.0:
             raise ValueError("Quest filter reference rate must be positive")
-        if self.max_predict_s < 0.0:
-            raise ValueError("Quest prediction horizon must be non-negative")
-        if not 0.0 < self.velocity_alpha <= 1.0:
-            raise ValueError("Quest velocity alpha must satisfy 0 < alpha <= 1")
         self.wrist_origin: np.ndarray | None = None
         self.ee_origin: np.ndarray | None = None
         self._filtered: np.ndarray | None = None
-        self._velocity = np.zeros(3)
-        self._last_delta = np.zeros(3)
-        self._last_sample_time: float | None = None
-        self._last_filter_time: float | None = None
+        self._last_wrist: np.ndarray | None = None
+        self._last_timestamp: float | None = None
         self.last_wrist_speed_m_s = 0.0
         self.last_alpha = self.ema_alpha
         self.last_sample_hz = 0.0
@@ -385,10 +368,8 @@ class QuestWristMapper:
         self.wrist_origin = None
         self.ee_origin = None
         self._filtered = None
-        self._velocity = np.zeros(3)
-        self._last_delta = np.zeros(3)
-        self._last_sample_time = None
-        self._last_filter_time = None
+        self._last_wrist = None
+        self._last_timestamp = None
         self.last_wrist_speed_m_s = 0.0
         self.last_alpha = self.ema_alpha
         self.last_sample_hz = 0.0
@@ -406,14 +387,12 @@ class QuestWristMapper:
         self.wrist_origin = wrist.copy()
         self.ee_origin = ee.copy()
         self._filtered = ee.copy()
-        self._velocity = np.zeros(3)
-        self._last_delta = np.zeros(3)
-        self._last_sample_time = (
+        self._last_wrist = wrist.copy()
+        self._last_timestamp = (
             float(timestamp)
             if timestamp is not None and np.isfinite(timestamp)
             else None
         )
-        self._last_filter_time = None
         self.last_wrist_speed_m_s = 0.0
         self.last_alpha = self.ema_alpha
         self.last_sample_hz = 0.0
@@ -426,22 +405,11 @@ class QuestWristMapper:
             raise ValueError("Quest robot origin must contain finite values")
         self.ee_origin = ee.copy()
         self._filtered = ee.copy()
-        # Re-anchoring (for example after Home) starts a new motion segment.
-        # Do not carry velocity or packet timing from the previous segment into
-        # the new origin, otherwise the first target can jump or drift.
-        self._velocity = np.zeros(3)
-        self._last_delta = np.zeros(3)
-        self._last_sample_time = None
-        self._last_filter_time = None
-        self.last_wrist_speed_m_s = 0.0
-        self.last_alpha = self.ema_alpha
-        self.last_sample_hz = 0.0
 
     def target_pos(
         self,
         wrist_position: np.ndarray,
         timestamp: float | None = None,
-        now: float | None = None,
     ) -> np.ndarray:
         if not self.calibrated:
             raise RuntimeError("Quest origin has not been set")
@@ -451,50 +419,23 @@ class QuestWristMapper:
         robot_delta = self.gain * (R_UNITY_TO_ROBOT @ relative)
         robot_delta[np.abs(robot_delta) < self.deadzone_m] = 0.0
         robot_delta = np.clip(robot_delta, -self.max_delta_m, self.max_delta_m)
+        raw_target = self.ee_origin + robot_delta
         sample_time = (
             float(timestamp)
             if timestamp is not None and np.isfinite(timestamp)
             else time.monotonic()
         )
-        eval_time = (
-            float(now)
-            if now is not None and np.isfinite(now)
-            else sample_time
-        )
-
-        # Estimate velocity only on genuine new samples and smooth it, so
-        # jittery packet intervals no longer feed noise into the target.
-        if self._last_sample_time is None or sample_time > self._last_sample_time:
-            if self._last_sample_time is not None:
-                dt = sample_time - self._last_sample_time
-                if dt > 0.0:
-                    inst_vel = (robot_delta - self._last_delta) / dt
-                    self.last_sample_hz = 1.0 / dt
-                    self._velocity += self.velocity_alpha * (
-                        inst_vel - self._velocity
-                    )
-                    self.last_wrist_speed_m_s = float(
-                        np.linalg.norm(self._velocity)
-                    )
-            self._last_delta = robot_delta.copy()
-            self._last_sample_time = sample_time
-
-        # Extrapolate the newest sample forward to the evaluation time so the
-        # control loop keeps moving smoothly between packets instead of
-        # freezing at each sample and stepping on the next one.
-        if (
-            self._last_sample_time is not None
-            and eval_time > self._last_sample_time
-        ):
-            horizon = min(
-                eval_time - self._last_sample_time, self.max_predict_s
+        dt = None
+        if self._last_timestamp is not None and sample_time > self._last_timestamp:
+            dt = sample_time - self._last_timestamp
+        if dt is not None and self._last_wrist is not None:
+            self.last_wrist_speed_m_s = float(
+                np.linalg.norm(wrist - self._last_wrist) / dt
             )
-            predicted_delta = self._last_delta + self._velocity * horizon
+            self.last_sample_hz = 1.0 / dt
         else:
-            predicted_delta = self._last_delta
-
-        raw_target = self.ee_origin + predicted_delta
-
+            self.last_wrist_speed_m_s = 0.0
+            self.last_sample_hz = 0.0
         speed_blend = np.clip(
             (self.last_wrist_speed_m_s - self.slow_speed_m_s)
             / (self.fast_speed_m_s - self.slow_speed_m_s),
@@ -505,12 +446,13 @@ class QuestWristMapper:
             self.ema_alpha
             + speed_blend * (self.fast_ema_alpha - self.ema_alpha)
         )
-        if self._last_filter_time is None:
+        if dt is None:
             alpha = base_alpha
         else:
-            filter_dt = max(eval_time - self._last_filter_time, 0.0)
+            # Preserve roughly the same filter time constant if the Quest
+            # packet rate changes instead of changing the apparent hand feel.
             reference_steps = float(
-                np.clip(filter_dt * self.filter_reference_hz, 0.25, 4.0)
+                np.clip(dt * self.filter_reference_hz, 0.25, 4.0)
             )
             alpha = 1.0 - (1.0 - base_alpha) ** reference_steps
         self.last_alpha = float(np.clip(alpha, 0.0, 1.0))
@@ -518,5 +460,6 @@ class QuestWristMapper:
             self._filtered = raw_target.copy()
         else:
             self._filtered += self.last_alpha * (raw_target - self._filtered)
-        self._last_filter_time = eval_time
+        self._last_wrist = wrist.copy()
+        self._last_timestamp = sample_time
         return self._filtered.copy()

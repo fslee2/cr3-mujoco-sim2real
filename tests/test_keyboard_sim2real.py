@@ -330,18 +330,6 @@ class KeyboardSim2RealTests(unittest.TestCase):
         controller._clear_motion_keys.assert_called_once_with()
         controller.on_disable.assert_called_once_with(confirm=False, force=True)
 
-    def test_focus_cleanup_ignores_transient_combobox_popdown_race(self):
-        controller = object.__new__(gui.CR3ControlGUI)
-        controller.root = Mock()
-        controller.root.focus_get.side_effect = KeyError("popdown")
-        controller._clear_motion_keys = Mock()
-        controller.keyboard_status_var = Mock()
-
-        controller._clear_keys_if_window_inactive()
-
-        controller._clear_motion_keys.assert_not_called()
-        controller.keyboard_status_var.set.assert_not_called()
-
     @patch("run_keyboard_sim2real_gui.messagebox.askyesno")
     @patch("run_keyboard_sim2real_gui.disable_robot")
     def test_forced_disable_has_no_confirmation_dialog(self, disable, askyesno):
