@@ -3405,13 +3405,6 @@ class CR3ControlGUI:
         robot_ip = self._active_robot_ip()
         if robot_ip is None:
             return
-        quest_control_mode = (
-            "XYZ+R"
-            if self.quest_orientation_mode_var.get()
-            and self.quest_orientation_origin is not None
-            else "XYZ"
-        )
-
         if not messagebox.askyesno(
             "HaMeR 实机同步 · 最终确认",
             "实体 CR3 与 MuJoCo 已在统一 Home，当前手位将再次归零。\n\n"
@@ -4523,6 +4516,12 @@ class CR3ControlGUI:
         robot_ip = self._active_robot_ip()
         if robot_ip is None:
             return
+        quest_control_mode = (
+            "XYZ+R"
+            if self.quest_orientation_mode_var.get()
+            and self.quest_orientation_origin is not None
+            else "XYZ"
+        )
 
         if not messagebox.askyesno(
             "Quest 实机同步 · 最终确认",
