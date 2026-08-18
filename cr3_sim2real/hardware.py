@@ -23,20 +23,26 @@ STRICT_20_PERCENT_LIMIT_DEG_S = CR3_MAX_JOINT_SPEED_DEG_S * 0.20
 DEFAULT_LIVE_JOINT_SPEED_DEG_S = 18.0
 DEFAULT_LIVE_TRACKING_ERROR_DEG = 5.0
 LIVE_SERVO_PERIOD_S = 0.03
-# ServoJ motion time per point. Keep it modest so the arm does not lag too far
-# behind the command stream; smoothness is handled by lookahead blending below.
-LIVE_SERVO_T_S = 0.05
+# Send one ServoJ target every command period.  Keeping ``t`` aligned with the
+# host period avoids overlapping point durations becoming a second, hidden
+# trajectory generator inside the controller.
+LIVE_SERVO_T_S = LIVE_SERVO_PERIOD_S
 # ServoJ lookahead (PID "D"-like damping). At the API default of 50 the arm
 # visibly runs point-to-point at 33 Hz; a larger value blends consecutive
 # commands into one continuous motion.
 LIVE_SERVO_LOOKAHEAD = 100.0
-# Adaptively smooth discrete IK targets before the strict velocity limiter.
-# Slow motion keeps enough smoothing to suppress steps; fast motion minimizes
-# added delay so the physical arm remains responsive.
-LIVE_TARGET_FILTER_SLOW_ALPHA = 0.55
-LIVE_TARGET_FILTER_FAST_ALPHA = 0.90
+# The host-side target filter is intentionally neutral.  The single
+# authoritative smoothing stage is the joint-rate limiter below; a second
+# adaptive EMA made the response change between "stuck" and "catch up" while
+# the GUI was already producing a filtered q_target.
+LIVE_TARGET_FILTER_SLOW_ALPHA = 1.0
+LIVE_TARGET_FILTER_FAST_ALPHA = 1.0
 LIVE_TARGET_FILTER_SLOW_SPEED_DEG_S = 1.0
 LIVE_TARGET_FILTER_FAST_SPEED_DEG_S = 12.0
+# Do not let a long idle gap enlarge the first post-idle command.  Normal
+# network/scheduling jitter is allowed up to this cap and uses its real dt.
+LIVE_MAX_CONTROL_DT_S = 0.05
+LIVE_IDLE_RESET_S = 0.25
 FEEDBACK_WATCHDOG_S = 0.20
 FEEDBACK_CONNECT_TIMEOUT_S = 2.0
 FEEDBACK_RECONNECT_DELAY_S = 0.25
@@ -831,9 +837,21 @@ class LiveServoHardware:
             self._last_send_time = now
             self.last_planned_speed_deg_s = 0.0
             return self._last_command_deg.copy()
-        # Always use one nominal command period. Using elapsed wall time here
-        # would let an idle pause or slow render frame bypass the speed limit.
-        control_dt = LIVE_SERVO_PERIOD_S
+        # Use the actual interval between accepted commands so the host-side
+        # velocity limit remains physically consistent when TCP or Windows
+        # scheduling adds a few milliseconds of jitter.  A long idle interval
+        # is reset to one nominal period instead of allowing a large jump.
+        if elapsed > LIVE_IDLE_RESET_S:
+            control_dt = LIVE_SERVO_PERIOD_S
+        elif abs(elapsed - LIVE_SERVO_PERIOD_S) <= 1.0e-4:
+            # Keep deterministic nominal-period behavior for an on-time tick;
+            # tiny clock noise should not leak into a joint command value.
+            control_dt = LIVE_SERVO_PERIOD_S
+        else:
+            control_dt = min(
+                max(elapsed, 1.0e-4),
+                LIVE_MAX_CONTROL_DT_S,
+            )
         planned = limit_joint_velocity(
             self._last_command_deg,
             filtered_target,
