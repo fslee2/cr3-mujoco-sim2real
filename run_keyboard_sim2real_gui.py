@@ -50,11 +50,7 @@ from cr3_sim2real.joint_mapping import (
     real_deg_to_sim_rad,
     sim_rad_to_real_deg,
 )
-from cr3_sim2real.quest_hand import (
-    QuestHandReceiver,
-    QuestWristMapper,
-    quest_quaternion_to_robot_rotation,
-)
+from cr3_sim2real.quest_hand import QuestHandReceiver, QuestWristMapper
 from cr3_sim2real.trajectory import (
     TrajectoryRecorder,
     build_servoj_dry_run,
@@ -1001,9 +997,7 @@ class CR3ControlGUI:
         self.quest_real_confirm_until = 0.0
         self.quest_real_origin_after_sequence = 0
         self.quest_last_valid_wrist_at = 0.0
-        self.quest_orientation_mode_var = tk.BooleanVar(value=False)
-        self.quest_orientation_origin: np.ndarray | None = None
-        self.quest_link6_orientation_origin: np.ndarray | None = None
+        self.quest_orientation_mode_var = tk.BooleanVar(value=True)
 
         self.last_tick = time.monotonic()
         self.last_render = 0.0
@@ -1553,8 +1547,8 @@ class CR3ControlGUI:
         ttk.Checkbutton(
             quest_mode,
             text=self._tr(
-                "Quest 姿态跟随（实验）",
-                "Quest orientation follow (experimental)",
+                "锁定末端姿态（RX=-90°  RY=0°  RZ=-90°）",
+                "Lock tool pose (RX=-90°  RY=0°  RZ=-90°)",
             ),
             variable=self.quest_orientation_mode_var,
             command=self._on_quest_orientation_toggle,
@@ -2135,11 +2129,16 @@ class CR3ControlGUI:
             return
         if self.real_busy or self.estop_latched:
             return
-        self.q_target = core.HOME_Q_RAD.copy()
+        home_q = (
+            core.QUEST_HOME_Q_RAD
+            if self.mode_var.get() == "quest"
+            else core.HOME_Q_RAD
+        )
+        self.q_target = home_q.copy()
         if self.mode_var.get() == "hamer" and self.hamer_mapper.calibrated:
             home_data = mujoco.MjData(self.model)
             home_data.qpos[:] = self.data.qpos
-            home_data.qpos[self.arm_qpos_indices] = core.HOME_Q_RAD
+            home_data.qpos[self.arm_qpos_indices] = home_q
             home_data.qvel[:] = 0.0
             mujoco.mj_forward(self.model, home_data)
             home_ee_pos = home_data.xpos[self.end_effector_id].copy()
@@ -2152,15 +2151,11 @@ class CR3ControlGUI:
         elif self.mode_var.get() == "quest" and self.quest_mapper.calibrated:
             home_data = mujoco.MjData(self.model)
             home_data.qpos[:] = self.data.qpos
-            home_data.qpos[self.arm_qpos_indices] = core.HOME_Q_RAD
+            home_data.qpos[self.arm_qpos_indices] = home_q
             home_data.qvel[:] = 0.0
             mujoco.mj_forward(self.model, home_data)
             home_ee_pos = home_data.xpos[self.end_effector_id].copy()
             self.quest_mapper.reanchor_robot_origin(home_ee_pos)
-            if getattr(self, "quest_orientation_origin", None) is not None:
-                self.quest_link6_orientation_origin = home_data.xmat[
-                    self.end_effector_id
-                ].reshape(3, 3).copy()
             self.quest_status_var.set("Quest 腕部原点已保留 · Link6 基准已对齐 Home")
             self.log(
                 "Quest Home 保留腕部原点；"
@@ -2278,10 +2273,6 @@ class CR3ControlGUI:
             self.hamer_mapper.reanchor_robot_origin(home_ee)
         if self.quest_mapper.calibrated:
             self.quest_mapper.reanchor_robot_origin(home_ee)
-            if getattr(self, "quest_orientation_origin", None) is not None:
-                self.quest_link6_orientation_origin = self.data.xmat[
-                    self.end_effector_id
-                ].reshape(3, 3).copy()
         self._update_feedback_display(state)
         self.status_var.set("REAL ROBOT AT HOME")
         self.log("实体 CR3 已到 Home；MuJoCo 已对齐，已有手部原点已重新锚定到 Link6。")
@@ -3269,6 +3260,14 @@ class CR3ControlGUI:
         mujoco.mj_forward(self.model, self.data)
         return self.data.xpos[self.end_effector_id].copy()
 
+    def _set_quest_home_now(self) -> np.ndarray:
+        """Set MuJoCo to Quest's horizontal-tool handover Home."""
+        self.q_target = core.QUEST_HOME_Q_RAD.copy()
+        self.data.qpos[self.arm_qpos_indices] = core.QUEST_HOME_Q_RAD
+        self.data.qvel[:] = 0.0
+        mujoco.mj_forward(self.model, self.data)
+        return self.data.xpos[self.end_effector_id].copy()
+
     def prepare_hamer_real_home(self) -> None:
         """First confirmation: align, then move real and simulation to Home."""
         if not self.args.enable_real_execution:
@@ -4022,70 +4021,22 @@ class CR3ControlGUI:
         dialog.transient(self.root)
         dialog.grab_set()
 
-    def _clear_quest_orientation_origin(self) -> None:
-        self.quest_orientation_origin = None
-        self.quest_link6_orientation_origin = None
-
-    def _capture_quest_orientation_origin(
-        self,
-        snapshot,
-        link6_rotation: np.ndarray | None = None,
-    ) -> bool:
-        """Capture a relative Quest-to-Link6 orientation calibration."""
-        if snapshot.wrist_quaternion is None:
-            self._clear_quest_orientation_origin()
-            return False
-        try:
-            quest_rotation = quest_quaternion_to_robot_rotation(
-                snapshot.wrist_quaternion
-            )
-        except ValueError as exc:
-            self._clear_quest_orientation_origin()
-            self.log(f"Quest 腕部姿态无效，暂不启用姿态跟随：{exc}")
-            return False
-        if link6_rotation is None:
-            link6_rotation = self.data.xmat[self.end_effector_id]
-        rotation = np.asarray(link6_rotation, dtype=float).reshape(3, 3)
-        if not np.isfinite(rotation).all():
-            self._clear_quest_orientation_origin()
-            return False
-        self.quest_orientation_origin = quest_rotation.copy()
-        self.quest_link6_orientation_origin = rotation.copy()
-        return True
-
     def _quest_target_rotation(self, snapshot) -> np.ndarray | None:
-        if (
-            not self.quest_orientation_mode_var.get()
-            or self.quest_orientation_origin is None
-            or self.quest_link6_orientation_origin is None
-            or snapshot.wrist_quaternion is None
-        ):
+        if not self.quest_orientation_mode_var.get():
             return None
-        try:
-            current_quest_rotation = quest_quaternion_to_robot_rotation(
-                snapshot.wrist_quaternion
-            )
-        except ValueError:
-            return None
-        relative = self.quest_orientation_origin.T @ current_quest_rotation
-        return self.quest_link6_orientation_origin @ relative
+        # Quest now uses a fixed, calibrated horizontal tool pose.  The wrist
+        # quaternion remains available in the receiver for diagnostics, but
+        # does not rotate the real or simulated end effector.
+        return core.QUEST_HOME_ROTATION.copy()
 
     def _on_quest_orientation_toggle(self) -> None:
         if not self.quest_orientation_mode_var.get():
-            self._clear_quest_orientation_origin()
-            self.log("Quest 姿态跟随已关闭；恢复 XYZ-only 控制。")
+            self.log("Quest 固定末端姿态已关闭；将只跟踪 XYZ（姿态可能漂移）。")
             return
-        receiver = self.quest_receiver
-        if receiver is None or not self.quest_mapper.calibrated:
-            self.log("Quest 姿态跟随已开启；设定腕部原点后开始姿态保持。")
-            return
-        snapshot = receiver.get(self.quest_hand_var.get())
-        if not snapshot.has_wrist or time.monotonic() - snapshot.received_at > 0.75:
-            self.log("Quest 姿态跟随已开启；等待新鲜腕部四元数后再设定原点。")
-            return
-        if self._capture_quest_orientation_origin(snapshot):
-            self.quest_last_sequence = snapshot.wrist_sequence
-            self.log("Quest 姿态原点已按当前 Link6 姿态重建。")
+        self.log(
+            "Quest 固定末端姿态已开启："
+            "RX=-90°、RY=0°、RZ=-90°；Quest 只控制 XYZ。"
+        )
 
     def toggle_quest(self) -> None:
         if self.quest_receiver is None:
@@ -4163,7 +4114,6 @@ class CR3ControlGUI:
             receiver.stop()
         if clear_origin:
             self.quest_mapper.clear_origin()
-        self._clear_quest_orientation_origin()
         self.quest_phase = "idle"
         self.quest_last_sequence = 0
         self._set_button_text(self.quest_button, "启动 Quest 接收")
@@ -4193,7 +4143,6 @@ class CR3ControlGUI:
             ee_pos,
             timestamp=snapshot.received_at,
         )
-        orientation_ready = self._capture_quest_orientation_origin(snapshot)
         self.quest_phase = "live"
         self.quest_last_sequence = snapshot.wrist_sequence
         self.quest_last_wrist_received_at = snapshot.received_at
@@ -4204,8 +4153,7 @@ class CR3ControlGUI:
         self.log(
             "Quest 腕部原点已设定："
             f"wrist={np.round(snapshot.wrist_position, 4).tolist()}  "
-            f"Link6={np.round(ee_pos, 4).tolist()}"
-            + ("；姿态原点已记录。" if orientation_ready else "。")
+            f"Link6={np.round(ee_pos, 4).tolist()}。"
         )
 
     def _update_quest(self, now: float) -> None:
@@ -4254,7 +4202,7 @@ class CR3ControlGUI:
         if self.quest_real_stage == "waiting_origin":
             return
         if self.quest_real_stage in ("homing", "ready", "connecting"):
-            self.q_target = core.HOME_Q_RAD.copy()
+            self.q_target = core.QUEST_HOME_Q_RAD.copy()
             return
         wrist_mm = np.round(snapshot.wrist_position * 1000.0, 1).tolist()
         landmark_count = 0 if snapshot.landmarks is None else len(snapshot.landmarks)
@@ -4377,7 +4325,7 @@ class CR3ControlGUI:
             self.log(f"参数无效：{exc}")
             return
 
-        home_deg = sim_rad_to_real_deg(core.HOME_Q_RAD)
+        home_deg = sim_rad_to_real_deg(core.QUEST_HOME_Q_RAD)
         if not messagebox.askyesno(
             "Quest 实机同步 · 第一次确认",
             "将冻结 Quest 仿真目标，并让实体 CR3 与 MuJoCo 自动回到统一 Home。\n\n"
@@ -4394,7 +4342,7 @@ class CR3ControlGUI:
         self.real_stop_event = threading.Event()
         self.quest_real_stage = "homing"
         self.quest_real_confirm_until = 0.0
-        self.q_target = core.HOME_Q_RAD.copy()
+        self.q_target = core.QUEST_HOME_Q_RAD.copy()
         self._set_button_text(self.quest_real_button, "停止回 Home")
         self.quest_status_var.set("Quest 实机准备 · 仿真与实机正在回统一 Home")
         self.status_var.set("QUEST REAL HOMING")
@@ -4427,7 +4375,7 @@ class CR3ControlGUI:
     def _quest_real_home_complete(self, _state) -> None:
         if self.quest_real_stage != "homing" or self.estop_latched:
             return
-        self._set_sim_home_now()
+        self._set_quest_home_now()
         self.quest_real_stage = "waiting_origin"
         receiver = self.quest_receiver
         self.quest_real_origin_after_sequence = (
@@ -4448,20 +4396,12 @@ class CR3ControlGUI:
         wrist_position: np.ndarray,
         received_at: float,
     ) -> None:
-        home_ee = self._set_sim_home_now()
+        home_ee = self._set_quest_home_now()
         self.quest_mapper.calibrate(
             wrist_position,
             home_ee,
             timestamp=received_at,
         )
-        receiver = self.quest_receiver
-        orientation_ready = False
-        if receiver is not None:
-            snapshot = receiver.get(self.quest_hand_var.get())
-            orientation_ready = self._capture_quest_orientation_origin(
-                snapshot,
-                self.data.xmat[self.end_effector_id],
-            )
         self.quest_last_wrist_received_at = received_at
         self.quest_last_valid_wrist_at = received_at
         self.quest_real_stage = "ready"
@@ -4478,7 +4418,6 @@ class CR3ControlGUI:
             "Quest 实机原点已自动重建："
             f"wrist={np.round(wrist_position, 4).tolist()}，"
             f"Home Link6={np.round(home_ee, 4).tolist()}。"
-            + ("姿态原点已记录。" if orientation_ready else "")
         )
 
     def confirm_quest_real_sync(self) -> None:
@@ -4496,7 +4435,7 @@ class CR3ControlGUI:
         try:
             state = self.monitor.require_fresh(max_age=0.5)
             require_motion_ready(state)
-            home_deg = sim_rad_to_real_deg(core.HOME_Q_RAD)
+            home_deg = sim_rad_to_real_deg(core.QUEST_HOME_Q_RAD)
             if not joint_target_reached(state, home_deg):
                 raise RuntimeError("实体 CR3 已离开 Home 或仍在运动")
             snapshot = receiver.get(self.quest_hand_var.get())
@@ -4517,10 +4456,9 @@ class CR3ControlGUI:
         if robot_ip is None:
             return
         quest_control_mode = (
-            "XYZ+R"
+            "XYZ + 固定姿态"
             if self.quest_orientation_mode_var.get()
-            and self.quest_orientation_origin is not None
-            else "XYZ"
+            else "XYZ（姿态不锁定）"
         )
 
         if not messagebox.askyesno(
@@ -4552,15 +4490,11 @@ class CR3ControlGUI:
             return
 
         assert snapshot.wrist_position is not None
-        home_ee = self._set_sim_home_now()
+        home_ee = self._set_quest_home_now()
         self.quest_mapper.calibrate(
             snapshot.wrist_position,
             home_ee,
             timestamp=snapshot.received_at,
-        )
-        self._capture_quest_orientation_origin(
-            snapshot,
-            self.data.xmat[self.end_effector_id],
         )
         self.quest_last_wrist_received_at = snapshot.received_at
         self.quest_last_valid_wrist_at = snapshot.received_at
@@ -4600,7 +4534,7 @@ class CR3ControlGUI:
         self.last_applied_live_speed = hardware.max_joint_speed_deg_s
         self.quest_real_stage = "active"
         self._set_sim_from_real(state.joints_deg)
-        self.q_target = core.HOME_Q_RAD.copy()
+        self.q_target = core.QUEST_HOME_Q_RAD.copy()
         hardware.start_stream(sim_rad_to_real_deg(self.q_target))
         self.quest_status_var.set(
             "Quest 实机同步 ACTIVE · "

@@ -167,6 +167,14 @@ class KeyboardSim2RealTests(unittest.TestCase):
         error = app.rotation_error_vector(target, np.eye(3), max_angle_rad=np.deg2rad(30.0))
         self.assertAlmostEqual(float(np.linalg.norm(error)), np.deg2rad(30.0), places=7)
 
+    def test_quest_home_pose_locks_tool_z_to_world_x(self):
+        # The third rotation column is the tool/TCP Z axis in the world frame.
+        np.testing.assert_allclose(
+            app.QUEST_HOME_ROTATION[:, 2],
+            [1.0, 0.0, 0.0],
+            atol=1e-12,
+        )
+
     def test_cartesian_tracking_limit_uses_speed_and_caps_stale_dt(self):
         limited = gui.limit_cartesian_tracking_step(
             [0.10, 0.0, 0.0], max_speed_m_s=0.8, dt=0.02

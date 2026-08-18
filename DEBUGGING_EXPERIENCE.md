@@ -63,7 +63,9 @@ Quest UDP wrist XYZ
   -> 实机发送链路（仅启用实机时）
 ```
 
-Quest的Quaternion目前不是末端旋转输入。Quest模式使用设置原点时记录的MuJoCo Link6姿态作为保持姿态。
+Quest的Quaternion目前不参与末端旋转控制。Quest模式进入接管前会回到独立的水平工具Home，
+固定目标姿态为`RX=-90°、RY=0°、RZ=-90°`，使TCP Z轴近似平行世界`+X`；Quest只改变XYZ。
+原有的通用Home仍用于键盘、回放和普通实时同步。
 
 ### 3.3 反馈链路
 

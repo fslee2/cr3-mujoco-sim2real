@@ -46,6 +46,37 @@ MUJOCO_ROOT = ROOT.parents[1] / "mujoco_ws"
 DEFAULT_MODEL = MUJOCO_ROOT / "scenes" / "cr3_scene.xml"
 DEFAULT_OUTPUT_DIR = ROOT / "trajectories"
 HOME_Q_RAD = np.array([0.0, 0.6072, -1.7223, -0.2949, 1.6134, 0.0])
+# Quest-specific handover Home captured from the user's horizontal-tool pose.
+# This is intentionally separate from the project's generic Home used by
+# playback and ordinary keyboard/live-sync modes.
+QUEST_HOME_Q_RAD = np.deg2rad(
+    [0.0, 34.79, -98.63, 63.62, 92.45, 0.0]
+)
+QUEST_HOME_EULER_DEG = np.array([-90.0, 0.0, -90.0], dtype=float)
+
+
+def _rotation_x(angle_rad: float) -> np.ndarray:
+    c, s = np.cos(angle_rad), np.sin(angle_rad)
+    return np.array([[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]])
+
+
+def _rotation_y(angle_rad: float) -> np.ndarray:
+    c, s = np.cos(angle_rad), np.sin(angle_rad)
+    return np.array([[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]])
+
+
+def _rotation_z(angle_rad: float) -> np.ndarray:
+    c, s = np.cos(angle_rad), np.sin(angle_rad)
+    return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+
+
+# Dobot's Rx/Ry/Rz convention for this project is represented as Rz Ry Rx.
+# The resulting Link6/TCP Z axis is horizontal and points along world +X.
+QUEST_HOME_ROTATION = (
+    _rotation_z(np.deg2rad(QUEST_HOME_EULER_DEG[2]))
+    @ _rotation_y(np.deg2rad(QUEST_HOME_EULER_DEG[1]))
+    @ _rotation_x(np.deg2rad(QUEST_HOME_EULER_DEG[0]))
+)
 
 # Simulation responsiveness is intentionally independent from real-robot
 # SpeedJ/AccJ. These values only affect the MuJoCo preview.
