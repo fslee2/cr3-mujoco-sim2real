@@ -23,6 +23,7 @@ from cr3_sim2real.joint_mapping import (
     real_deg_to_sim_rad,
     sim_rad_to_real_deg,
 )
+from cr3_sim2real.quest_hand import QUEST_MOTION_MODE_REVERSED_END
 from cr3_sim2real.hardware import (
     CR3_MAX_JOINT_SPEED_DEG_S,
     DEFAULT_LIVE_JOINT_SPEED_DEG_S,
@@ -53,6 +54,17 @@ QUEST_HOME_Q_RAD = np.deg2rad(
     [182.16, -20.71, 113.30, 89.92, 94.18, 0.10]
 )
 QUEST_HOME_EULER_DEG = np.array([92.43, 0.59, 88.17], dtype=float)
+
+
+def quest_home_q_rad_for_mode(motion_mode: str) -> np.ndarray:
+    """Pick the Home that matches the selected Quest motion mode.
+
+    The original base mapping keeps the generic Home (J1=0).  The reversed
+    tool mapping pairs with the horizontal-tool handover Home (J1~=180).
+    """
+    if str(motion_mode).strip().lower() == QUEST_MOTION_MODE_REVERSED_END:
+        return QUEST_HOME_Q_RAD
+    return HOME_Q_RAD
 
 
 def _rotation_x(angle_rad: float) -> np.ndarray:

@@ -18,6 +18,7 @@ remain locked unless
 
 - [English setup and safety guide](docs/keyboard_sim2real_en.md)
 - [中文说明](docs/keyboard_sim2real.md)
+- [Project handoff document](PROJECT_HANDOFF.md)
 - Install dependencies with `python -m pip install -r requirements-sim2real.txt`
 
 # 1\. Introduction

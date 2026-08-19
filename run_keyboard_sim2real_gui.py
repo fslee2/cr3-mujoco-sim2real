@@ -7,6 +7,7 @@ import ipaddress
 import math
 from pathlib import Path
 import queue
+import subprocess
 import threading
 import time
 import tkinter as tk
@@ -40,17 +41,18 @@ from cr3_sim2real.hardware import (
     stream_live_target_until_reached,
     wait_for_drag_state,
 )
-from cr3_sim2real.hamer_bridge import (
-    HamerArmMapper,
-    HamerBridgeTracker,
-    hamer_cam_t,
-)
 from cr3_sim2real.joint_mapping import (
     MAPPING_CALIBRATED,
     real_deg_to_sim_rad,
     sim_rad_to_real_deg,
 )
-from cr3_sim2real.quest_hand import QuestHandReceiver, QuestWristMapper
+from cr3_sim2real.quest_hand import (
+    QUEST_MOTION_MODE_ORIGINAL,
+    QUEST_MOTION_MODE_REVERSED_END,
+    QuestHandReceiver,
+    QuestWristMapper,
+    quest_quaternion_to_robot_rotation,
+)
 from cr3_sim2real.trajectory import (
     TrajectoryRecorder,
     build_servoj_dry_run,
@@ -70,13 +72,14 @@ KEY_REPEAT_PERIOD_S = 0.05
 QUEST_CONTROL_RATE_HZ = 60.0
 QUEST_DEFAULT_CARTESIAN_SPEED_M_S = 0.80
 QUEST_MAX_CONTROL_DT_S = 0.05
-HAMER_REAL_HOME_SPEED_DEG_S = 5.0
+QUEST_HAND_RELAY_PORT = 9001
+CRAFT_HAND_REPO = core.ROOT.parent.parent / "CRAFT-Hand_API"
+CRAFT_HAND_SCRIPT = CRAFT_HAND_REPO / "python" / "streamer_thumb_opposition_follow.py"
+CRAFT_HAND_PYTHON = CRAFT_HAND_REPO / ".venv" / "Scripts" / "python.exe"
+QUEST_REAL_HOME_SPEED_DEG_S = 5.0
 MANUAL_REAL_HOME_SPEED_DEG_S = 5.0
-HAMER_REAL_HAND_WATCHDOG_S = 5.0
-HAMER_REAL_CONFIRMATION_WINDOW_S = 30.0
-DEFAULT_HAMER_ORIGIN_VIDEO = (
-    core.ROOT.parent.parent / "mujoco_ws" / "hand_sequence.avi"
-)
+QUEST_REAL_HAND_WATCHDOG_S = 5.0
+QUEST_REAL_CONFIRMATION_WINDOW_S = 30.0
 
 ROBOT_MODE_NAMES = {
     1: "INIT",
@@ -136,20 +139,8 @@ UI_TEXT_EN = {
     "录制后回放": "Record",
     "实时同步": "Live",
     "示教拖拽": "Teach",
-    "HaMeR 仿真": "HaMeR",
-    "HaMeR 参数…": "Settings…",
-    "HaMeR 实时仿真": "HaMeR Camera",
-    "停止 HaMeR 实时": "Stop HaMeR Live",
-    "正在打开摄像头…": "Opening Camera…",
-    "Testing HaMeR": "Testing HaMeR",
-    "正在打开测试视频…": "Opening Test Video…",
-    "原点已确定 · 验证中": "Origin Set · Validating",
-    "停止测试视频": "Stop Test",
-    "HaMeR 实机同步": "HaMeR Robot Sync",
-    "停止 HaMeR 实机同步": "Stop HaMeR Robot Sync",
     "停止回 Home": "Stop Homing",
     "等待手部原点…": "Waiting for Hand Origin…",
-    "最终确认 HaMeR 实机同步": "Final Confirm HaMeR Robot Sync",
     "Meta Quest 仿真": "Meta Quest",
     "Quest 设置…": "Quest Settings…",
     "启动 Quest 接收": "Start Quest Receiver",
@@ -158,6 +149,17 @@ UI_TEXT_EN = {
     "Quest 实机同步": "Quest Robot Sync",
     "最终确认 Quest 实机同步": "Final Confirm Quest Robot Sync",
     "Quest 实机限速 (deg/s)": "Quest Speed Limit (deg/s)",
+    "Quest 运动映射": "Quest Motion Mapping",
+    "原本·基座 XYZ": "Original · base XYZ",
+    "反向末端 XYZ": "Reversed tool XYZ",
+    "CRAFT 灵巧手实机输出（谨慎）": "CRAFT hand hardware output (caution)",
+    "启动 Quest 手部跟随": "Start Quest hand follower",
+    "停止 Quest 手部跟随": "Stop Quest hand follower",
+    "平移": "Translation",
+    "旋转": "Rotation",
+    "锁定末端姿态（RX=+92.43°  RY=+0.59°  RZ=+88.17°）": "Lock tool pose (RX=+92.43°  RY=+0.59°  RZ=+88.17°)",
+    "显示 Quest 腕部目标 (mocap)": "Show Quest wrist target (mocap)",
+    "到 Quest Home": "Go Quest Home",
     "启动实时同步": "Start Live",
     "停止实时同步": "Stop Live",
     "取消连接": "Cancel Connection",
@@ -203,8 +205,6 @@ UI_TEXT_EN = {
     "控制器遥测：反馈连接失败": "Controller telemetry: connection failed",
     "关节力学：反馈连接失败": "Joint mechanics: connection failed",
     "TCP / 六维力：反馈连接失败": "TCP / 6-axis force: connection failed",
-    "Testing HaMeR=测试视频 · 实时摄像头中按 R 设定原点":
-        "Testing HaMeR = test video · press R in live camera to set origin",
     "Quest 未启动 · 仅控制 MuJoCo":
         "Quest inactive · MuJoCo only",
 }
@@ -223,11 +223,7 @@ LOG_TEXT_EN = {
     "请先点击“启动实时同步”。": "Click Start Live Sync first.",
     "示教拖拽模式禁用键盘和 GUI 点动，请直接安全地拖动实体机械臂。":
         "Keyboard and GUI jogging are disabled in teaching mode; move the physical robot by hand.",
-    "HaMeR 模式由手部位移独占控制；请停止 HaMeR 实时仿真或切换模式后再键盘点动。":
-        "HaMeR exclusively controls motion; stop HaMeR live simulation or change mode before jogging.",
     "实时同步或示教拖拽模式禁用 Home。": "Home is disabled during live sync or teaching.",
-    "HaMeR 实机接管流程中禁用手动 Home；请使用 HaMeR 实机同步按钮停止。":
-        "Manual Home is disabled during HaMeR robot handover; use the HaMeR Robot Sync button to stop.",
     "MuJoCo 正在返回 Home；实体机器人不受影响。":
         "MuJoCo is returning Home; the physical robot is unaffected.",
     "实机回 Home 已锁定：请使用 --enable-real-execution 启动 GUI。":
@@ -260,8 +256,6 @@ LOG_TEXT_EN = {
     "软件急停已锁存；请在 DobotStudio 清除并重新使能。":
         "Software E-stop is latched; reset it and re-enable the robot in DobotStudio.",
     "请先退出示教拖拽，再武装真实回放。": "Exit teaching before arming real playback.",
-    "HaMeR 当前是仿真专用模式；请停止 HaMeR 实时仿真并切换到录制回放后再武装实机。":
-        "HaMeR is currently in simulation mode; stop it and switch to record/playback before arming playback.",
     "请先完成轨迹记录和 Dry Run。": "Complete trajectory recording and Dry Run first.",
     "关节映射未标定，禁止真实回放。": "Joint mapping is not calibrated; real playback is prohibited.",
     "真实回放已武装 15 秒；尚未发送运动命令。":
@@ -346,55 +340,7 @@ LOG_TEXT_EN = {
         "Software E-stop triggered; local motion is locked and EmergencyStop() is being sent.",
     "请在 DobotStudio 手动解除急停、清除报警，然后重新使能。":
         "Reset E-stop and alarms in DobotStudio, then re-enable the robot.",
-    "原点设置/验证视频正在播放，请等待视频结束。":
-        "The origin setup/validation video is playing; wait for it to finish.",
-    "HaMeR 实机同步锁定：请使用 --enable-real-execution 启动 GUI。":
-        "HaMeR Robot Sync is locked; start the GUI with --enable-real-execution.",
-    "软件急停、真实回放或示教拖拽活动时不能启动 HaMeR 实机同步。":
-        "HaMeR Robot Sync cannot start during E-stop, real playback, or teaching.",
-    "请先启动 HaMeR 实时仿真，在摄像头中按 R，并完成仿真验证。":
-        "Start HaMeR live simulation, press R in the camera view, and validate simulation first.",
-    "HaMeR 摄像头未运行。": "The HaMeR camera is not running.",
     "另一个实时实机连接已经活动，请先停止。": "Another live robot connection is active; stop it first.",
-    "正在先连接 30004 只读反馈；连接后请再次点击 HaMeR 实机同步。":
-        "Connecting port 30004 feedback first; click HaMeR Robot Sync again afterward.",
-    "用户取消了 HaMeR 实机同步第一次确认。":
-        "The user cancelled the first HaMeR Robot Sync confirmation.",
-    "第一次确认完成：已按 30004 自动对齐，正在以 5°/s 回统一 Home。":
-        "First confirmation accepted: aligned from 30004 and returning to shared Home at 5 deg/s.",
-    "用户取消了 HaMeR 实机同步最终确认。":
-        "The user cancelled final HaMeR Robot Sync confirmation.",
-    "HaMeR 实机同步已启动；当前控制链为 HaMeR → MuJoCo IK → CR3 ServoJ。":
-        "HaMeR Robot Sync started: HaMeR → MuJoCo IK → CR3 ServoJ.",
-    "原点视频正在打开，请稍候再按第二次。": "The origin video is opening; wait before the second click.",
-    "真实回放或示教拖拽活动时不能设置 HaMeR 原点。":
-        "The HaMeR origin cannot be set during real playback or teaching.",
-    "请先停止实时实机同步；HaMeR 当前仅控制 MuJoCo。":
-        "Stop live robot sync first; HaMeR currently controls MuJoCo only.",
-    "请先停止 HaMeR 实时仿真，再重新设置原点。":
-        "Stop HaMeR live simulation before resetting the origin.",
-    "原点验证视频正在控制 MuJoCo，请等待播放完成。":
-        "The origin validation video is controlling MuJoCo; wait for playback to finish.",
-    "原点设置视频已在处理。": "The origin setup video is already being processed.",
-    "原点视频正在打开；画面出现后，第二次点击同一按钮确定当前帧为原点。":
-        "Opening the origin video; click the same button again to use the displayed frame as origin.",
-    "真实回放或示教拖拽活动时不能启动 HaMeR 实时仿真。":
-        "HaMeR live simulation cannot start during real playback or teaching.",
-    "请先停止实时实机同步；HaMeR 实时模式当前仅控制 MuJoCo。":
-        "Stop live robot sync first; HaMeR live mode currently controls MuJoCo only.",
-    "HaMeR 实时摄像头已启动；按 R 之前只显示画面，不移动 MuJoCo。":
-        "HaMeR live camera started; before R is pressed it displays video without moving MuJoCo.",
-    "HaMeR 实时仿真已停止。": "HaMeR live simulation stopped.",
-    "当前没有正在播放的 Testing HaMeR 视频。": "No Testing HaMeR video is currently playing.",
-    "Testing HaMeR 视频已手动停止；MuJoCo 保持当前位姿。":
-        "Testing HaMeR video stopped manually; MuJoCo holds its current pose.",
-    "请先启动“HaMeR 实时仿真”，然后在摄像头画面中按 R 设定原点。":
-        "Start HaMeR Live Simulation, then press R in the camera view to set the origin.",
-    "请先点击“原点设置视频”打开视频。": "Click the origin video button first.",
-    "原点视频将继续播放；后续手部位移现在会直接驱动 MuJoCo 机械臂。":
-        "The origin video will continue; subsequent hand motion now drives the MuJoCo arm.",
-    "Testing HaMeR 验证已完成；MuJoCo 保持最终位姿。":
-        "Testing HaMeR validation completed; MuJoCo holds the final pose.",
     "请先点击“退出示教拖拽”，再切换控制模式。": "Exit teaching before changing control mode.",
     "示教模式命令正在执行，请稍候。": "A teaching command is running; please wait.",
     "示教拖拽已锁定：请使用 --enable-real-execution 启动 GUI。":
@@ -413,8 +359,6 @@ LOG_TEXT_EN = {
         "Live sync is locked; start the GUI with --enable-real-execution.",
     "软件急停、真实回放或示教拖拽活动时不能启动实时同步。":
         "Live sync cannot start during E-stop, real playback, or teaching.",
-    "当前 HaMeR 仅允许控制 MuJoCo；请先停止 HaMeR 实时仿真再启动实时实机同步。":
-        "HaMeR currently controls MuJoCo only; stop it before starting live robot sync.",
     "正在先建立共享的 30004 反馈；连接完成后请再次点击“启动实时同步”。":
         "Connecting shared port 30004 feedback first; click Start Live Sync again afterward.",
     "实时同步已停止，本地不再发送 ServoJ。": "Live sync stopped; ServoJ is no longer transmitted.",
@@ -422,20 +366,8 @@ LOG_TEXT_EN = {
     "正在进入示教拖拽，请等待状态验证完成后再关闭 GUI。":
         "Teaching is starting; wait for state verification before closing the GUI.",
     "示教模式命令正在执行，请稍候再退出。": "A teaching command is running; wait before exiting.",
-    "用户取消了 HaMeR 实机接管流程。": "The user cancelled the HaMeR robot handover.",
-    "用户停止了 HaMeR 实机同步。": "The user stopped HaMeR Robot Sync.",
-    "HaMeR 实机同步第二次确认已超时。": "The second HaMeR Robot Sync confirmation timed out.",
-    "HaMeR 实机同步第二次确认已超时，请重新准备。":
-        "The second HaMeR Robot Sync confirmation timed out; prepare again.",
     "界面语言已切换为英文。": "Interface language switched to English.",
     "界面语言已切换为中文。": "Interface language switched to Chinese.",
-    "HaMeR 映射参数必须是数字": "HaMeR mapping parameters must be numeric",
-    "HaMeR 映射参数必须是正的有限数":
-        "HaMeR mapping parameters must be positive and finite",
-    "HaMeR EMA 系数必须在 (0, 1] 内":
-        "The HaMeR EMA coefficient must be in (0, 1]",
-    "原点定义视频路径不能为空":
-        "The origin-definition video path cannot be empty",
     "Quest 接收已停止。": "Quest receiver stopped.",
     "Quest 实时接收已启动；按 R 前只显示腕部数据，不移动 MuJoCo。":
         "Quest receiver started; before R is pressed, wrist data is displayed without moving MuJoCo.",
@@ -489,17 +421,7 @@ LOG_FRAGMENT_EN = (
     ("，请稍候。", ", please wait."),
     ("无效的机器人 IP：", "Invalid robot IP: "),
     ("机器人 IP 必须是 IPv4 地址", "Robot IP must be an IPv4 address"),
-    ("实体 CR3 和 MuJoCo 已到统一 Home；验证阶段的仿真偏移已丢弃。", "The physical CR3 and MuJoCo reached shared Home; simulation-validation offset was discarded. "),
-    ("下一帧有效 HaMeR 手位将自动成为新的实机控制原点。", "The next valid HaMeR hand pose will become the new robot-control origin."),
-    ("Home 不清除 HaMeR 手部原点；", "Home keeps the HaMeR hand origin; "),
     ("Link6 基准已更新为", "Link6 anchor updated to"),
-    ("HaMeR 实机原点已自动重建：", "HaMeR robot origin rebuilt automatically: "),
-    ("HaMeR 实时摄像头原点已设定：", "HaMeR live-camera origin set: "),
-    ("HaMeR 原点已由第二次按键时的视频帧确定：", "HaMeR origin set from the video frame selected by the second click: "),
-    ("当前视频帧没有有效手部 cam_t；", "The current video frame has no valid hand cam_t; "),
-    ("实时摄像头当前没有有效手部 cam_t；", "The live camera has no valid hand cam_t; "),
-    ("桥接状态：", "bridge status: "),
-    ("最近推理耗时：", "latest inference time: "),
     ("记录完成：", "Recording completed: "),
     ("已保存：", "Saved: "),
     ("Dry Run 通过：", "Dry Run passed: "),
@@ -530,24 +452,9 @@ LOG_FRAGMENT_EN = (
     ("DisableRobot 失败：", "DisableRobot failed: "),
     ("EmergencyStop 已被控制器接受：", "EmergencyStop accepted by the controller: "),
     ("EmergencyStop 发送失败：", "EmergencyStop transmission failed: "),
-    ("HaMeR 实机接管前状态检查失败：", "HaMeR handover precheck failed: "),
-    ("HaMeR 实机同步最终检查失败：", "HaMeR Robot Sync final check failed: "),
-    ("HaMeR 实机同步未启动：", "HaMeR Robot Sync did not start: "),
-    ("HaMeR 实机同步准备失效：", "HaMeR Robot Sync preparation became invalid: "),
-    ("当前没有有效手部 cam_t", "no valid hand cam_t is available"),
-    ("最终确认后没有有效手部 cam_t", "no valid hand cam_t is available after final confirmation"),
     ("实体 CR3 已离开 Home 或仍在运动", "the physical CR3 left Home or is still moving"),
     ("最终确认期间实体 CR3 离开了 Home", "the physical CR3 left Home during final confirmation"),
-    ("最终确认后的手部结果已过期", "the hand result after final confirmation is stale"),
-    ("有效手部数据超过", "valid hand data has not updated for more than "),
     ("未更新，实机发送已停止。", "; robot transmission stopped."),
-    ("关闭 HaMeR 30003 失败：", "Failed to close HaMeR port 30003: "),
-    ("HaMeR 实机同步已中止：", "HaMeR Robot Sync aborted: "),
-    ("HaMeR 原点视频设置无效：", "Invalid HaMeR origin-video setting: "),
-    ("HaMeR 实时设置无效：", "Invalid HaMeR live setting: "),
-    ("HaMeR 启动失败：", "HaMeR startup failed: "),
-    ("HaMeR 停止异常：", "HaMeR stop error: "),
-    ("HaMeR 视频释放异常：", "HaMeR video release error: "),
     ("Quest 接收启动失败：", "Quest receiver startup failed: "),
     ("Quest 腕部原点已设定：", "Quest wrist origin set: "),
     ("Quest Home 保留腕部原点；", "Quest Home keeps the wrist origin; "),
@@ -571,6 +478,16 @@ LOG_FRAGMENT_EN = (
     ("最终确认后没有 Quest 腕部数据", "no Quest wrist data is available after final confirmation"),
     ("最终确认后的 Quest 腕部数据已过期", "Quest wrist data is stale after final confirmation"),
     ("Quest 实机限速", "Quest robot speed limit"),
+    ("Quest 已切换为反向末端 XYZ：保留前后方向，Y/Z 相对原本映射翻转。", "Quest switched to reversed tool XYZ: forward/back stays unchanged; Y/Z are flipped."),
+    ("Quest 已切换为原本基座 XYZ 映射。", "Quest switched to the original base-frame XYZ mapping."),
+    ("Quest 映射已改变；为防止跳变，请按 R 重新设定腕部原点。", "Quest mapping changed; press R to re-zero the wrist origin and prevent a jump."),
+    ("请先启动 Quest 接收，再启动 CRAFT 手部跟随。", "Start Quest receiving before starting the CRAFT hand follower."),
+    ("未找到 CRAFT streamer：", "CRAFT streamer not found: "),
+    ("Quest CRAFT 手部跟随启动失败：", "Quest CRAFT hand follower failed to start: "),
+    ("Quest CRAFT 手部跟随已启动（", "Quest CRAFT hand follower started ("),
+    ("）；Quest 数据通过本地端口 ", "); Quest data is relayed through localhost port "),
+    ("Quest CRAFT 手部跟随已停止。", "Quest CRAFT hand follower stopped."),
+    ("Quest CRAFT 手部跟随已退出（code=", "Quest CRAFT hand follower exited (code="),
     ("示教拖拽要求机器人无报警、已使能且处于空闲模式 5；当前 ", "Teaching requires an alarm-free, enabled robot in idle mode 5; current "),
     ("正在监听 ", "listening on "),
     ("，控制手=", ", control hand="),
@@ -792,6 +709,18 @@ def describe_alarm_groups(
     return descriptions
 
 
+# Translation axes use a blue family, rotation axes a teal family; within each
+# group X/Y/Z and RX/RY/RZ shade progressively darker-to-lighter.
+MOTION_BUTTON_COLORS = {
+    "X": {"fill": "#1b4b7d", "hover": "#26639f", "pressed": "#0f8bc0"},
+    "Y": {"fill": "#1d5c84", "hover": "#2a74a8", "pressed": "#1292c6"},
+    "Z": {"fill": "#216e8c", "hover": "#3086ac", "pressed": "#169ccd"},
+    "RX": {"fill": "#0f6b5a", "hover": "#188a75", "pressed": "#0ea68a"},
+    "RY": {"fill": "#117b66", "hover": "#1b977e", "pressed": "#12b295"},
+    "RZ": {"fill": "#138d72", "hover": "#20a88a", "pressed": "#17c2a0"},
+}
+
+
 class RoundedButton(tk.Canvas):
     """Small dependency-free rounded button for the primary GUI controls."""
 
@@ -808,6 +737,8 @@ class RoundedButton(tk.Canvas):
         pressed_fill: str = "#087fb9",
         foreground: str = "#eef6ff",
         height: int = 44,
+        badge: str | None = None,
+        badge_fill: str = "#0a1420",
         font=("Segoe UI Semibold", 11),
     ) -> None:
         super().__init__(
@@ -827,6 +758,8 @@ class RoundedButton(tk.Canvas):
         self._hover_fill = hover_fill
         self._pressed_fill = pressed_fill
         self._foreground = foreground
+        self._badge = badge
+        self._badge_fill = badge_fill
         self._font = font
         self._state = "normal"
         self.bind("<Configure>", self._redraw)
@@ -879,6 +812,25 @@ class RoundedButton(tk.Canvas):
             fill=self._foreground,
             font=self._font,
         )
+        if self._badge:
+            bx = width - 14
+            by = 14
+            badge_radius = 10
+            self.create_oval(
+                bx - badge_radius,
+                by - badge_radius,
+                bx + badge_radius,
+                by + badge_radius,
+                fill=self._badge_fill,
+                outline="",
+            )
+            self.create_text(
+                bx,
+                by,
+                text=self._badge,
+                fill="#eef6ff",
+                font=("Segoe UI Bold", 9),
+            )
 
     def _enter(self, _event) -> None:
         if self._state != "pressed":
@@ -930,14 +882,17 @@ class CR3ControlGUI:
         )
         if self.end_effector_id < 0:
             raise ValueError("MuJoCo end-effector body Link6 was not found")
-        quest_home = core.QUEST_HOME_Q_RAD
         quest_limits = self.model.jnt_range[self.arm_joint_ids]
-        if np.any(quest_home < quest_limits[:, 0]) or np.any(
-            quest_home > quest_limits[:, 1]
+        for home_q, home_name in (
+            (core.HOME_Q_RAD, "generic Home"),
+            (core.QUEST_HOME_Q_RAD, "Quest Home"),
         ):
-            raise ValueError(
-                "Quest Home is outside the MuJoCo joint limits; refusing to start"
-            )
+            if np.any(home_q < quest_limits[:, 0]) or np.any(
+                home_q > quest_limits[:, 1]
+            ):
+                raise ValueError(
+                    f"{home_name} is outside the MuJoCo joint limits; refusing to start"
+                )
 
         self.q_target = core.HOME_Q_RAD.copy()
         self.data.qpos[self.arm_qpos_indices] = self.q_target
@@ -980,22 +935,13 @@ class CR3ControlGUI:
         self.teach_active = False
         self.teach_starting = False
         self.dashboard_action_busy = False
-        self.hamer_tracker: HamerBridgeTracker | None = None
-        self.hamer_starting = False
-        self.hamer_mapper = HamerArmMapper()
-        self.hamer_phase = "idle"
-        self.hamer_last_sequence = 0
-        self.hamer_next_poll = 0.0
-        self.hamer_latest_frame: np.ndarray | None = None
-        self.hamer_latest_frame_sequence = 0
-        self.hamer_rendered_frame_key: tuple[int, int, int] | None = None
-        self.hamer_last_status = ""
-        self.hamer_real_stage = "idle"
-        self.hamer_real_confirm_until = 0.0
-        self.hamer_last_valid_hand_at = 0.0
-        self.hamer_real_origin_after_sequence = 0
         self.quest_receiver: QuestHandReceiver | None = None
         self.quest_mapper = QuestWristMapper()
+        self.quest_motion_mode_var = tk.StringVar(value=QUEST_MOTION_MODE_ORIGINAL)
+        self._quest_home_rotation: np.ndarray | None = None
+        self.quest_hand_process: subprocess.Popen[str] | None = None
+        self.quest_hand_output_thread: threading.Thread | None = None
+        self.quest_hand_relay_enabled = False
         self.quest_phase = "idle"
         self.quest_last_sequence = 0
         self.quest_last_wrist_received_at = 0.0
@@ -1006,6 +952,18 @@ class CR3ControlGUI:
         self.quest_real_origin_after_sequence = 0
         self.quest_last_valid_wrist_at = 0.0
         self.quest_orientation_mode_var = tk.BooleanVar(value=True)
+        self.show_quest_mocap_var = tk.BooleanVar(value=True)
+        self.quest_last_target_pos: np.ndarray | None = None
+        mocap_body_id = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_BODY, "quest_wrist_marker"
+        )
+        self._quest_mocap_id: int | None = None
+        self._quest_mocap_geom_id: int | None = None
+        if mocap_body_id >= 0:
+            self._quest_mocap_id = int(self.model.body_mocapid[mocap_body_id])
+            marker_geom = int(np.flatnonzero(self.model.geom_bodyid == mocap_body_id)[0])
+            self._quest_mocap_geom_id = marker_geom
+            self.model.geom_rgba[marker_geom, 3] = 0.0  # hidden until Quest is live
 
         self.last_tick = time.monotonic()
         self.last_render = 0.0
@@ -1014,8 +972,6 @@ class CR3ControlGUI:
         self.drag_y = 0
         self.canvas_image_id: int | None = None
         self.photo_image: ImageTk.PhotoImage | None = None
-        self.hamer_preview_image_id: int | None = None
-        self.hamer_preview_photo: ImageTk.PhotoImage | None = None
         self.pressed_motion_keys: dict[str, float] = {}
         self.key_release_jobs: dict[str, str] = {}
 
@@ -1048,17 +1004,6 @@ class CR3ControlGUI:
         self.render_resolution_var = tk.StringVar(value=f"{VIEW_WIDTH} × {VIEW_HEIGHT}")
         self.live_speed_status_var = tk.StringVar(value="实时同步未启动")
         self.teach_status_var = tk.StringVar(value="示教拖拽未启动")
-        self.hamer_status_var = tk.StringVar(value="Testing HaMeR=测试视频 · 实时摄像头中按 R 设定原点")
-        self.hamer_bridge_url_var = tk.StringVar(value=args.hamer_bridge_url)
-        self.hamer_video_var = tk.StringVar(value=args.hamer_video or "")
-        self.hamer_camera_id_var = tk.StringVar(value=str(args.hamer_camera_id))
-        self.hamer_x_gain_var = tk.StringVar(value="0.03")
-        self.hamer_yz_gain_var = tk.StringVar(value="2.0")
-        self.hamer_depth_deadband_var = tk.StringVar(value="0.015")
-        self.hamer_filter_alpha_var = tk.StringVar(value="0.15")
-        self.hamer_filter_deadzone_var = tk.StringVar(value="0.03")
-        self.hamer_filter_step_var = tk.StringVar(value="0.06")
-        self.hamer_ee_step_var = tk.StringVar(value="0.03")
         self.quest_protocol_var = tk.StringVar(value=args.quest_protocol)
         self.quest_host_var = tk.StringVar(value=args.quest_host)
         self.quest_port_var = tk.StringVar(value=str(args.quest_port))
@@ -1071,7 +1016,7 @@ class CR3ControlGUI:
             value=f"{QUEST_DEFAULT_CARTESIAN_SPEED_M_S:g}"
         )
         self.quest_real_speed_var = tk.StringVar(
-            value=f"{HAMER_REAL_HOME_SPEED_DEG_S:g}"
+            value=f"{QUEST_REAL_HOME_SPEED_DEG_S:g}"
         )
         self.quest_status_var = tk.StringVar(value="Quest 未启动 · 仅控制 MuJoCo")
         self.last_applied_live_speed: float | None = None
@@ -1156,14 +1101,6 @@ class CR3ControlGUI:
             foreground=[("disabled", "#708096")],
         )
         style.configure(
-            "Motion.TButton",
-            background="#13233a",
-            foreground="#b9d7ff",
-            padding=(10, 9),
-            font=("Segoe UI Semibold", 12),
-        )
-        style.map("Motion.TButton", background=[("active", "#205b8f"), ("pressed", "#0d87c7")])
-        style.configure(
             "TEntry",
             fieldbackground="#0d1726",
             foreground="#f2f7ff",
@@ -1193,6 +1130,30 @@ class CR3ControlGUI:
             font=("Microsoft YaHei UI", 12),
         )
         style.map("TRadiobutton", background=[("active", "#111c2e")])
+        style.configure(
+            "Card.TCheckbutton",
+            background="#111c2e",
+            foreground="#d8e3f0",
+            font=("Microsoft YaHei UI", 12),
+            indicatorcolor="#0d1726",
+            indicatorbackground="#0d1726",
+            selectcolor="#17c2a0",
+            indicatormargin=5,
+            padding=(2, 3),
+        )
+        style.map(
+            "Card.TCheckbutton",
+            background=[("active", "#15233a")],
+            foreground=[("disabled", "#708096")],
+            indicatorcolor=[
+                ("selected", "#17c2a0"),
+                ("active", "#2a74a8"),
+            ],
+            indicatorbackground=[
+                ("selected", "#17c2a0"),
+                ("active", "#1d4b6e"),
+            ],
+        )
 
         top = ttk.Frame(self.root, padding=(16, 10))
         top.pack(fill=tk.X)
@@ -1308,19 +1269,30 @@ class CR3ControlGUI:
             style="Card.TLabelframe",
         )
         motion_buttons = (
-            ("X−  [Q]", "q", 0, 0), ("X+  [E]", "e", 1, 0),
-            ("Y−  [A]", "a", 0, 1), ("Y+  [D]", "d", 1, 1),
-            ("Z−  [S]", "s", 0, 2), ("Z+  [W]", "w", 1, 2),
-            ("RX− [K]", "k", 0, 3), ("RX+ [I]", "i", 1, 3),
-            ("RY− [J]", "j", 0, 4), ("RY+ [L]", "l", 1, 4),
-            ("RZ− [U]", "u", 0, 5), ("RZ+ [O]", "o", 1, 5),
+            ("X−  [Q]", "q", "X", 1, 0), ("X+  [E]", "e", "X", 2, 0),
+            ("Y−  [A]", "a", "Y", 1, 1), ("Y+  [D]", "d", "Y", 2, 1),
+            ("Z−  [S]", "s", "Z", 1, 2), ("Z+  [W]", "w", "Z", 2, 2),
+            ("RX− [K]", "k", "RX", 1, 3), ("RX+ [I]", "i", "RX", 2, 3),
+            ("RY− [J]", "j", "RY", 1, 4), ("RY+ [L]", "l", "RY", 2, 4),
+            ("RZ− [U]", "u", "RZ", 1, 5), ("RZ+ [O]", "o", "RZ", 2, 5),
         )
         for column in range(6):
             self.motion_bar.columnconfigure(column, weight=1)
-        for label, key, row, column in motion_buttons:
+        ttk.Label(
+            self.motion_bar, text="平移", style="Card.TLabel",
+        ).grid(row=0, column=0, columnspan=3, sticky="w", padx=4)
+        ttk.Label(
+            self.motion_bar, text="旋转", style="Card.TLabel",
+        ).grid(row=0, column=3, columnspan=3, sticky="w", padx=4)
+        for label, key, axis, row, column in motion_buttons:
+            colors = MOTION_BUTTON_COLORS[axis]
             button = RoundedButton(
                 self.motion_bar,
                 text=label,
+                badge=key.upper(),
+                fill=colors["fill"],
+                hover_fill=colors["hover"],
+                pressed_fill=colors["pressed"],
                 on_press=lambda k=key: self._start_motion_key(k),
                 on_release=lambda k=key: self._stop_motion_key(k),
                 height=46,
@@ -1469,61 +1441,8 @@ class CR3ControlGUI:
             value="teach",
             command=self.on_mode_changed,
         ).grid(row=0, column=2, sticky="w", padx=(18, 0))
-        hamer_mode = ttk.Frame(mode, style="Card.TFrame")
-        hamer_mode.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(7, 0))
-        for column in range(2):
-            hamer_mode.columnconfigure(column, weight=1)
-        ttk.Radiobutton(
-            hamer_mode,
-            text="HaMeR 仿真",
-            variable=self.mode_var,
-            value="hamer",
-            command=self.on_mode_changed,
-        ).grid(row=0, column=0, sticky="w")
-        ttk.Button(
-            hamer_mode,
-            text="HaMeR 参数…",
-            command=self.open_hamer_settings,
-        ).grid(row=0, column=1, sticky="ew", padx=(5, 0))
-        self.hamer_button = ttk.Button(
-            hamer_mode,
-            text="HaMeR 实时仿真",
-            command=self.toggle_hamer,
-        )
-        self.hamer_button.grid(row=1, column=1, sticky="ew", padx=(5, 0), pady=(5, 0))
-        self.hamer_origin_button = ttk.Button(
-            hamer_mode,
-            text="Testing HaMeR",
-            command=self.setup_hamer_origin_video,
-        )
-        self.hamer_origin_button.grid(row=1, column=0, sticky="ew", pady=(5, 0))
-        self.hamer_stop_video_button = ttk.Button(
-            hamer_mode,
-            text="停止测试视频",
-            command=self.stop_hamer_test_video,
-            state=tk.DISABLED,
-        )
-        self.hamer_stop_video_button.grid(
-            row=2,
-            column=0,
-            columnspan=2,
-            sticky="ew",
-            pady=(5, 0),
-        )
-        self.hamer_real_preview_button = ttk.Button(
-            hamer_mode,
-            text="HaMeR 实机同步",
-            command=self.toggle_hamer_real_sync,
-        )
-        self.hamer_real_preview_button.grid(
-            row=3,
-            column=0,
-            columnspan=2,
-            sticky="ew",
-            pady=(5, 0),
-        )
         quest_mode = ttk.Frame(mode, style="Card.TFrame")
-        quest_mode.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        quest_mode.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(8, 0))
         quest_mode.columnconfigure(0, weight=1)
         quest_mode.columnconfigure(1, weight=1)
         ttk.Radiobutton(
@@ -1560,11 +1479,43 @@ class CR3ControlGUI:
             ),
             variable=self.quest_orientation_mode_var,
             command=self._on_quest_orientation_toggle,
+            style="Card.TCheckbutton",
         ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(
+            quest_mode,
+            text=self._tr(
+                "显示 Quest 腕部目标 (mocap)",
+                "Show Quest wrist target (mocap)",
+            ),
+            variable=self.show_quest_mocap_var,
+            style="Card.TCheckbutton",
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        ttk.Label(
+            quest_mode,
+            text=self._tr("Quest 运动映射", "Quest motion mapping"),
+        ).grid(row=4, column=0, sticky="w", pady=(5, 0))
+        mapping_frame = ttk.Frame(quest_mode, style="Card.TFrame")
+        mapping_frame.grid(row=4, column=1, sticky="ew", padx=(5, 0), pady=(5, 0))
+        mapping_frame.columnconfigure(0, weight=1)
+        mapping_frame.columnconfigure(1, weight=1)
+        ttk.Radiobutton(
+            mapping_frame,
+            text=self._tr("原本·基座 XYZ", "Original · base XYZ"),
+            variable=self.quest_motion_mode_var,
+            value=QUEST_MOTION_MODE_ORIGINAL,
+            command=self._on_quest_motion_mode_changed,
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Radiobutton(
+            mapping_frame,
+            text=self._tr("反向末端 XYZ", "Reversed tool XYZ"),
+            variable=self.quest_motion_mode_var,
+            value=QUEST_MOTION_MODE_REVERSED_END,
+            command=self._on_quest_motion_mode_changed,
+        ).grid(row=0, column=1, sticky="w", padx=(5, 0))
         ttk.Label(
             quest_mode,
             text="Quest 实机限速 (deg/s)",
-        ).grid(row=3, column=0, sticky="w", pady=(5, 0))
+        ).grid(row=4, column=0, sticky="w", pady=(5, 0))
         self.quest_speed_spinbox = ttk.Spinbox(
             quest_mode,
             textvariable=self.quest_real_speed_var,
@@ -1574,15 +1525,28 @@ class CR3ControlGUI:
             width=8,
         )
         self.quest_speed_spinbox.grid(
-            row=3, column=1, sticky="ew", padx=(5, 0), pady=(5, 0)
+            row=4, column=1, sticky="ew", padx=(5, 0), pady=(5, 0)
         )
+        self.quest_hand_live_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            quest_mode,
+            text=self._tr("CRAFT 灵巧手实机输出（谨慎）", "CRAFT hand hardware output (caution)"),
+            variable=self.quest_hand_live_var,
+            style="Card.TCheckbutton",
+        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(5, 0))
+        self.quest_hand_button = ttk.Button(
+            quest_mode,
+            text=self._tr("启动 Quest 手部跟随", "Start Quest hand follower"),
+            command=self.toggle_quest_hand_follower,
+        )
+        self.quest_hand_button.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(5, 0))
         self.quest_real_button = ttk.Button(
             quest_mode,
             text="Quest 实机同步",
             command=self.toggle_quest_real_sync,
         )
         self.quest_real_button.grid(
-            row=4,
+            row=7,
             column=0,
             columnspan=2,
             sticky="ew",
@@ -1594,7 +1558,7 @@ class CR3ControlGUI:
             command=self.go_quest_home,
         )
         self.quest_home_button.grid(
-            row=5,
+            row=8,
             column=0,
             columnspan=2,
             sticky="ew",
@@ -1624,16 +1588,10 @@ class CR3ControlGUI:
         ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(3, 0))
         ttk.Label(
             mode,
-            textvariable=self.hamer_status_var,
-            style="Card.TLabel",
-            wraplength=315,
-        ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(3, 0))
-        ttk.Label(
-            mode,
             textvariable=self.quest_status_var,
             style="Card.TLabel",
             wraplength=315,
-        ).grid(row=7, column=0, columnspan=3, sticky="w", pady=(3, 0))
+        ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(3, 0))
 
         parameters = ttk.LabelFrame(controls, text="参数调节", padding=10, style="Card.TLabelframe")
         parameters.grid(row=1, column=0, sticky="nsew", padx=(0, 4), pady=(0, 7))
@@ -1790,7 +1748,6 @@ class CR3ControlGUI:
             self.keyboard_status_var,
             self.live_speed_status_var,
             self.teach_status_var,
-            self.hamer_status_var,
             self.quest_status_var,
         )
         for variable in runtime_variables:
@@ -1978,9 +1935,7 @@ class CR3ControlGUI:
                 self.run_dry_review()
             return "break"
         if event.keysym.lower() == "r":
-            if self.mode_var.get() == "hamer":
-                self.set_hamer_camera_origin()
-            elif self.mode_var.get() == "quest":
+            if self.mode_var.get() == "quest":
                 self.set_quest_origin()
             else:
                 self.toggle_record()
@@ -2123,9 +2078,6 @@ class CR3ControlGUI:
         if self.mode_var.get() == "teach" or self.teach_active:
             self.log("示教拖拽模式禁用键盘和 GUI 点动，请直接安全地拖动实体机械臂。")
             return False
-        if self.mode_var.get() == "hamer":
-            self.log("HaMeR 模式由手部位移独占控制；请停止 HaMeR 实时仿真或切换模式后再键盘点动。")
-            return False
         if self.mode_var.get() == "quest":
             self.log("Quest 模式由腕部位移独占控制；按 R 可重设原点，或停止 Quest 接收后再点动。")
             return False
@@ -2144,31 +2096,18 @@ class CR3ControlGUI:
         if self.mode_var.get() in ("live", "teach"):
             self.log("实时同步或示教拖拽模式禁用 Home。")
             return
-        if self.hamer_real_stage != "idle" or self.quest_real_stage != "idle":
+        if self.quest_real_stage != "idle":
             self.log("手部实机接管流程中禁用手动 Home；请先停止实机同步。")
             return
         if self.real_busy or self.estop_latched:
             return
         home_q = (
-            core.QUEST_HOME_Q_RAD
+            core.quest_home_q_rad_for_mode(self.quest_motion_mode_var.get())
             if self.mode_var.get() == "quest"
             else core.HOME_Q_RAD
         )
         self.q_target = home_q.copy()
-        if self.mode_var.get() == "hamer" and self.hamer_mapper.calibrated:
-            home_data = mujoco.MjData(self.model)
-            home_data.qpos[:] = self.data.qpos
-            home_data.qpos[self.arm_qpos_indices] = home_q
-            home_data.qvel[:] = 0.0
-            mujoco.mj_forward(self.model, home_data)
-            home_ee_pos = home_data.xpos[self.end_effector_id].copy()
-            self.hamer_mapper.reanchor_robot_origin(home_ee_pos)
-            self.hamer_status_var.set("HaMeR 手部原点已保留 · 机械臂基准已重新锚定到 Home")
-            self.log(
-                "Home 不清除 HaMeR 手部原点；"
-                f"Link6 基准已更新为 {np.round(home_ee_pos, 4).tolist()}。"
-            )
-        elif self.mode_var.get() == "quest" and self.quest_mapper.calibrated:
+        if self.mode_var.get() == "quest" and self.quest_mapper.calibrated:
             home_data = mujoco.MjData(self.model)
             home_data.qpos[:] = self.data.qpos
             home_data.qpos[self.arm_qpos_indices] = home_q
@@ -2208,7 +2147,6 @@ class CR3ControlGUI:
             or self.live_starting
             or self.teach_active
             or self.teach_starting
-            or self.hamer_real_stage != "idle"
             or self.quest_real_stage != "idle"
         ):
             self.log("当前存在其他实体运动流程；停止后才能让实机回 Home。")
@@ -2289,8 +2227,6 @@ class CR3ControlGUI:
         self.manual_home_active = False
         self._set_button_text(self.real_home_button, "实机回 Home")
         home_ee = self._set_sim_home_now()
-        if self.hamer_mapper.calibrated:
-            self.hamer_mapper.reanchor_robot_origin(home_ee)
         if self.quest_mapper.calibrated:
             self.quest_mapper.reanchor_robot_origin(home_ee)
         self._update_feedback_display(state)
@@ -2421,9 +2357,6 @@ class CR3ControlGUI:
         if self.teach_active or self.teach_starting:
             self.log("请先退出示教拖拽，再武装真实回放。")
             return
-        if self.mode_var.get() == "hamer" or self.hamer_tracker is not None:
-            self.log("HaMeR 当前是仿真专用模式；请停止 HaMeR 实时仿真并切换到录制回放后再武装实机。")
-            return
         if self.mode_var.get() == "quest" or self.quest_receiver is not None:
             self.log("Quest 仿真正在运行；请先停止 Quest 接收并切换到录制回放模式。")
             return
@@ -2456,12 +2389,19 @@ class CR3ControlGUI:
         if robot_ip is None:
             return
         if not messagebox.askyesno(
-            "最终真实运动确认",
-            "即将控制实体 CR3。\n\n"
-            f"IP: {robot_ip}\n"
-            f"主机关节限速: {CR3_MAX_JOINT_SPEED_DEG_S * speed / 100.0:.1f} deg/s\n"
-            f"AccJ: {acceleration}%（保留参数，ServoJ 不使用）\n\n"
-            "确认工作区安全并执行吗？",
+            self._tr("最终真实运动确认", "Final Real-Motion Confirmation"),
+            self._tr(
+                "即将控制实体 CR3。\n\n"
+                f"IP: {robot_ip}\n"
+                f"主机关节限速: {CR3_MAX_JOINT_SPEED_DEG_S * speed / 100.0:.1f} deg/s\n"
+                f"AccJ: {acceleration}%（保留参数，ServoJ 不使用）\n\n"
+                "确认工作区安全并执行吗？",
+                "About to control the physical CR3.\n\n"
+                f"IP: {robot_ip}\n"
+                f"Host joint speed limit: {CR3_MAX_JOINT_SPEED_DEG_S * speed / 100.0:.1f} deg/s\n"
+                f"AccJ: {acceleration}% (retained only; unused by ServoJ)\n\n"
+                "Confirm that the workspace is safe and execute?",
+            ),
             icon="warning",
         ):
             self.log("用户取消了最终真实回放确认。")
@@ -2556,7 +2496,6 @@ class CR3ControlGUI:
             or self.live_starting
             or self.teach_active
             or self.teach_starting
-            or self.hamer_real_stage != "idle"
             or self.quest_real_stage != "idle"
         )
 
@@ -2731,7 +2670,6 @@ class CR3ControlGUI:
         if (
             self.recorder.recording
             or self.real_busy
-            or self.hamer_real_stage != "idle"
             or self.quest_real_stage != "idle"
         ):
             self.log("记录或回放过程中不能重新对齐。")
@@ -2791,9 +2729,13 @@ class CR3ControlGUI:
             self.log("请先停止真实回放、实时同步或示教拖拽，再清除报警。")
             return
         if not messagebox.askyesno(
-            "清除 CR3 报警",
-            "只会发送 ClearError()，不会自动使能，也不会自动继续运动队列。\n\n"
-            "请先排除碰撞、急停或硬件故障原因。",
+            self._tr("清除 CR3 报警", "Clear CR3 Alarms"),
+            self._tr(
+                "只会发送 ClearError()，不会自动使能，也不会自动继续运动队列。\n\n"
+                "请先排除碰撞、急停或硬件故障原因。",
+                "Sends only ClearError(); it does not auto-enable or auto-resume the motion queue.\n\n"
+                "First rule out collisions, E-stop, or hardware fault causes.",
+            ),
             icon="warning",
         ):
             return
@@ -2827,12 +2769,8 @@ class CR3ControlGUI:
         self.armed_until = 0.0
         self.arm_status_var.set("未武装")
         self.live_starting = False
-        self.hamer_real_stage = "idle"
-        self.hamer_real_confirm_until = 0.0
         self.quest_real_stage = "idle"
         self.quest_real_confirm_until = 0.0
-        if hasattr(self, "hamer_real_preview_button"):
-            self._set_button_text(self.hamer_real_preview_button, "HaMeR 实机同步")
         if hasattr(self, "quest_real_button"):
             self._set_button_text(self.quest_real_button, "Quest 实机同步")
         live = self.live_hardware
@@ -2872,9 +2810,13 @@ class CR3ControlGUI:
             self.log("活动运动流程会自行管理队列，此时不能手动 Continue。")
             return
         if not messagebox.askyesno(
-            "继续 CR3 运动队列",
-            "Continue() 可能恢复控制器中尚未完成的排队命令。\n\n"
-            "请确认机械臂周围安全，并确认需要恢复该队列。",
+            self._tr("继续 CR3 运动队列", "Resume CR3 Motion Queue"),
+            self._tr(
+                "Continue() 可能恢复控制器中尚未完成的排队命令。\n\n"
+                "请确认机械臂周围安全，并确认需要恢复该队列。",
+                "Continue() may resume queued commands still pending in the controller.\n\n"
+                "Confirm the robot is safe and that this queue should be resumed.",
+            ),
             icon="warning",
         ):
             return
@@ -2913,9 +2855,13 @@ class CR3ControlGUI:
             self.log(f"参数无效：{exc}")
             return
         if not messagebox.askyesno(
-            "应用实机全局倍率",
-            f"将向控制器发送 SpeedFactor({percent})。\n\n"
-            "该倍率作用于控制器后续运动；实时同步仍同时受主机端 deg/s 限速约束。",
+            self._tr("应用实机全局倍率", "Apply Global Robot Scale"),
+            self._tr(
+                f"将向控制器发送 SpeedFactor({percent})。\n\n"
+                "该倍率作用于控制器后续运动；实时同步仍同时受主机端 deg/s 限速约束。",
+                f"Sending SpeedFactor({percent}) to the controller.\n\n"
+                "This scale applies to the controller's subsequent motion; live sync is still also bounded by the host-side deg/s limit.",
+            ),
             icon="warning",
         ):
             return
@@ -2955,9 +2901,13 @@ class CR3ControlGUI:
         if robot_ip is None:
             return
         if not messagebox.askyesno(
-            "使能实体 CR3",
-            f"将向 {robot_ip}:29999 发送 EnableRobot()。\n\n"
-            "请确认机械臂周围安全，并且已经进入 TCP/IP 二次开发模式。",
+            self._tr("使能实体 CR3", "Enable Physical CR3"),
+            self._tr(
+                f"将向 {robot_ip}:29999 发送 EnableRobot()。\n\n"
+                "请确认机械臂周围安全，并且已经进入 TCP/IP 二次开发模式。",
+                f"Sending EnableRobot() to {robot_ip}:29999.\n\n"
+                "Confirm the robot is safe and that TCP/IP secondary-development mode is active.",
+            ),
             icon="warning",
         ):
             return
@@ -2997,9 +2947,13 @@ class CR3ControlGUI:
         if robot_ip is None:
             return
         if not messagebox.askyesno(
-            "机器人上电",
-            f"将向 {robot_ip}:29999 发送 PowerOn()。\n\n"
-            "请确认控制器和机械臂周围安全。上电完成后仍需单独点击使能。",
+            self._tr("机器人上电", "Power On Robot"),
+            self._tr(
+                f"将向 {robot_ip}:29999 发送 PowerOn()。\n\n"
+                "请确认控制器和机械臂周围安全。上电完成后仍需单独点击使能。",
+                f"Sending PowerOn() to {robot_ip}:29999.\n\n"
+                "Confirm the controller and robot are safe. After power-on you still need to enable separately.",
+            ),
             icon="warning",
         ):
             return
@@ -3041,18 +2995,26 @@ class CR3ControlGUI:
         active_motion = (
             self.real_busy
             or self.live_hardware is not None
-            or self.hamer_real_stage != "idle"
             or self.quest_real_stage != "idle"
             or self.teach_active
         )
-        message = (
-            "将停止本地运动发送并向控制器发送 DisableRobot()。\n\n"
-            "这是正常停止/下使能，不是急停。"
-        )
-        if active_motion:
-            message += "\n\n当前存在活动的实体运动连接，将立即中止。"
         if confirm:
-            if not messagebox.askyesno("取消机器人使能", message, icon="warning"):
+            message = self._tr(
+                "将停止本地运动发送并向控制器发送 DisableRobot()。\n\n"
+                "这是正常停止/下使能，不是急停。",
+                "Stops local motion transmission and sends DisableRobot() to the controller.\n\n"
+                "This is the normal stop/disable, not an E-stop.",
+            )
+            if active_motion:
+                message += self._tr(
+                    "\n\n当前存在活动的实体运动连接，将立即中止。",
+                    "\n\nAn active physical-motion connection exists; it will be aborted immediately.",
+                )
+            if not messagebox.askyesno(
+                self._tr("取消机器人使能", "Disable Robot"),
+                message,
+                icon="warning",
+            ):
                 return
 
         if self.recorder.recording:
@@ -3064,12 +3026,8 @@ class CR3ControlGUI:
         self.armed_until = 0.0
         self.arm_status_var.set("未武装")
         self.live_starting = False
-        self.hamer_real_stage = "idle"
-        self.hamer_real_confirm_until = 0.0
         self.quest_real_stage = "idle"
         self.quest_real_confirm_until = 0.0
-        if hasattr(self, "hamer_real_preview_button"):
-            self._set_button_text(self.hamer_real_preview_button, "HaMeR 实机同步")
         if hasattr(self, "quest_real_button"):
             self._set_button_text(self.quest_real_button, "Quest 实机同步")
         self.teach_active = False
@@ -3121,12 +3079,8 @@ class CR3ControlGUI:
 
         live = self.live_hardware
         self.live_hardware = None
-        self.hamer_real_stage = "idle"
-        self.hamer_real_confirm_until = 0.0
         self.quest_real_stage = "idle"
         self.quest_real_confirm_until = 0.0
-        if hasattr(self, "hamer_real_preview_button"):
-            self._set_button_text(self.hamer_real_preview_button, "HaMeR 实机同步")
         if hasattr(self, "quest_real_button"):
             self._set_button_text(self.quest_real_button, "Quest 实机同步")
         self.teach_active = False
@@ -3163,114 +3117,14 @@ class CR3ControlGUI:
     def _estop_failed(self, exc: Exception) -> None:
         self.log(f"EmergencyStop 发送失败：{exc}")
         messagebox.showerror(
-            "软件急停发送失败",
-            f"无法确认控制器收到软件急停：\n{exc}\n\n请立即使用实体急停按钮。",
+            self._tr("软件急停发送失败", "Software E-Stop Transmission Failed"),
+            self._tr(
+                f"无法确认控制器收到软件急停：\n{exc}\n\n请立即使用实体急停按钮。",
+                f"Could not confirm the controller received the software E-stop:\n{exc}\n\nUse the physical E-stop button immediately.",
+            ),
         )
         if self.pending_close:
             self._finish_close()
-
-    def open_hamer_settings(self) -> None:
-        """Open the compact origin-video/live-camera mapping editor."""
-        window = tk.Toplevel(self.root)
-        window.title("HaMeR 仿真控制设置")
-        window.transient(self.root)
-        window.resizable(False, False)
-        panel = ttk.LabelFrame(
-            window,
-            text="HaMeR 原点视频与相对位移映射",
-            padding=14,
-            style="Card.TLabelframe",
-        )
-        panel.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        fields = (
-            ("HaMeR 服务地址", self.hamer_bridge_url_var),
-            ("内置原点定义视频", self.hamer_video_var),
-            ("实时模式摄像头 ID", self.hamer_camera_id_var),
-            ("深度→X 增益", self.hamer_x_gain_var),
-            ("水平/垂直→Y/Z 增益", self.hamer_yz_gain_var),
-            ("深度死区 (m)", self.hamer_depth_deadband_var),
-            ("EMA 系数", self.hamer_filter_alpha_var),
-            ("目标死区 (m)", self.hamer_filter_deadzone_var),
-            ("滤波最大步长 (m)", self.hamer_filter_step_var),
-            ("单帧 IK 最大步长 (m)", self.hamer_ee_step_var),
-        )
-        entries = []
-        for row, (label, variable) in enumerate(fields):
-            ttk.Label(panel, text=label).grid(row=row, column=0, sticky="w", pady=3)
-            entry = ttk.Entry(panel, textvariable=variable, width=42)
-            entry.grid(row=row, column=1, sticky="ew", padx=(12, 0), pady=3)
-            entries.append(entry)
-
-        def browse_video() -> None:
-            selected = filedialog.askopenfilename(
-                parent=window,
-                title="选择 HaMeR 原点定义视频",
-                filetypes=(("视频", "*.avi *.mp4 *.mov *.mkv"), ("所有文件", "*.*")),
-            )
-            if selected:
-                self.hamer_video_var.set(selected)
-
-        ttk.Button(panel, text="更换原点视频…", command=browse_video).grid(
-            row=1, column=2, padx=(6, 0), pady=3
-        )
-        ttk.Label(
-            panel,
-            text="Testing HaMeR 第一次点击打开测试视频，第二次选当前帧开始验证。实时摄像头中按 R 设置仿真原点；HaMeR 实机同步会自动让仿真和实机回到统一 Home，并在最终确认前重新归零。",
-            wraplength=520,
-            foreground="#72e3ad",
-        ).grid(row=len(fields), column=0, columnspan=3, sticky="w", pady=(10, 4))
-        ttk.Button(panel, text="完成", command=window.destroy).grid(
-            row=len(fields) + 1, column=0, columnspan=3, sticky="ew", pady=(7, 0)
-        )
-        panel.columnconfigure(1, weight=1)
-        entries[0].focus_set()
-
-    def _new_hamer_mapper(self) -> HamerArmMapper:
-        try:
-            x_gain = float(self.hamer_x_gain_var.get())
-            yz_gain = float(self.hamer_yz_gain_var.get())
-            depth_deadband = float(self.hamer_depth_deadband_var.get())
-            alpha = float(self.hamer_filter_alpha_var.get())
-            target_deadzone = float(self.hamer_filter_deadzone_var.get())
-            filter_step = float(self.hamer_filter_step_var.get())
-            max_ee_step = float(self.hamer_ee_step_var.get())
-        except ValueError as exc:
-            raise ValueError("HaMeR 映射参数必须是数字") from exc
-        values = np.array(
-            [x_gain, yz_gain, depth_deadband, alpha, target_deadzone, filter_step, max_ee_step]
-        )
-        if not np.isfinite(values).all() or np.any(values <= 0.0):
-            raise ValueError("HaMeR 映射参数必须是正的有限数")
-        if alpha > 1.0:
-            raise ValueError("HaMeR EMA 系数必须在 (0, 1] 内")
-        return HamerArmMapper(
-            depth_scale=x_gain,
-            lateral_vertical_scale=yz_gain,
-            depth_deadband=depth_deadband,
-            ema_alpha=alpha,
-            filter_deadzone=target_deadzone,
-            filter_max_step=filter_step,
-        )
-
-    def toggle_hamer(self) -> None:
-        if self.hamer_phase in ("origin_starting", "origin_video", "origin_validation"):
-            self.log("原点设置/验证视频正在播放，请等待视频结束。")
-            return
-        if self.hamer_phase in ("live_starting", "live_wait_origin", "live"):
-            self.stop_hamer(clear_origin=True)
-            return
-        self.start_hamer_live()
-
-    def toggle_hamer_real_sync(self) -> None:
-        """Advance or stop the guarded HaMeR simulation-to-real handover."""
-        if self.hamer_real_stage == "idle":
-            self.prepare_hamer_real_home()
-        elif self.hamer_real_stage == "ready":
-            self.confirm_hamer_real_sync()
-        elif self.hamer_real_stage in ("homing", "waiting_origin", "connecting"):
-            self.stop_hamer_real_sync("用户取消了 HaMeR 实机接管流程。")
-        elif self.hamer_real_stage == "active":
-            self.stop_hamer_real_sync("用户停止了 HaMeR 实机同步。")
 
     def _set_sim_home_now(self) -> np.ndarray:
         """Set MuJoCo exactly to the shared Home and return Link6 position."""
@@ -3281,11 +3135,18 @@ class CR3ControlGUI:
         return self.data.xpos[self.end_effector_id].copy()
 
     def _set_quest_home_now(self) -> np.ndarray:
-        """Set MuJoCo to Quest's horizontal-tool handover Home."""
-        self.q_target = core.QUEST_HOME_Q_RAD.copy()
-        self.data.qpos[self.arm_qpos_indices] = core.QUEST_HOME_Q_RAD
+        """Set MuJoCo to the Home matching the selected Quest motion mode.
+
+        The original base mapping uses the generic Home (J1=0); the reversed
+        tool mapping uses the horizontal-tool handover Home (J1~=180).  The
+        Link6 rotation at this Home is cached as the orientation-lock target.
+        """
+        home_q = core.quest_home_q_rad_for_mode(self.quest_motion_mode_var.get())
+        self.q_target = home_q.copy()
+        self.data.qpos[self.arm_qpos_indices] = home_q
         self.data.qvel[:] = 0.0
         mujoco.mj_forward(self.model, self.data)
+        self._quest_home_rotation = self.data.xmat[self.end_effector_id].copy()
         return self.data.xpos[self.end_effector_id].copy()
 
     def go_quest_home(self) -> None:
@@ -3294,11 +3155,15 @@ class CR3ControlGUI:
             self.log("软件急停已锁存，不能移动到 Quest Home。")
             return
         if self.quest_real_stage in ("homing", "ready", "connecting"):
-            self.q_target = core.QUEST_HOME_Q_RAD.copy()
+            self.q_target = core.quest_home_q_rad_for_mode(
+                self.quest_motion_mode_var.get()
+            ).copy()
             self.log("Quest 实机接管流程正在回 Quest Home。")
             return
         if self.quest_real_stage == "active" and self.live_hardware is not None:
-            self.q_target = core.QUEST_HOME_Q_RAD.copy()
+            self.q_target = core.quest_home_q_rad_for_mode(
+                self.quest_motion_mode_var.get()
+            ).copy()
             self.log("Quest 实机同步活动中，正在发送 Quest Home 目标。")
             return
         if self.real_busy or self.live_hardware is not None or self.teach_active:
@@ -3311,650 +3176,6 @@ class CR3ControlGUI:
             "MuJoCo 已到 Quest Home；"
             f"Link6={np.round(home_ee, 4).tolist()}。"
             "实体 CR3 请通过“Quest 实机同步”流程回到同一姿态。"
-        )
-
-    def prepare_hamer_real_home(self) -> None:
-        """First confirmation: align, then move real and simulation to Home."""
-        if not self.args.enable_real_execution:
-            self.log("HaMeR 实机同步锁定：请使用 --enable-real-execution 启动 GUI。")
-            return
-        if self.estop_latched or self.real_busy or self.teach_active:
-            self.log("软件急停、真实回放或示教拖拽活动时不能启动 HaMeR 实机同步。")
-            return
-        if self.hamer_phase != "live" or not self.hamer_mapper.calibrated:
-            self.log("请先启动 HaMeR 实时仿真，在摄像头中按 R，并完成仿真验证。")
-            return
-        if self.hamer_tracker is None:
-            self.log("HaMeR 摄像头未运行。")
-            return
-        if self.live_hardware is not None or self.live_starting:
-            self.log("另一个实时实机连接已经活动，请先停止。")
-            return
-        if self.monitor is None:
-            self.log("正在先连接 30004 只读反馈；连接后请再次点击 HaMeR 实机同步。")
-            self.connect_feedback()
-            return
-        robot_ip = self._active_robot_ip()
-        if robot_ip is None:
-            return
-        try:
-            state = self.monitor.require_fresh(max_age=0.5)
-            require_motion_ready(state)
-        except Exception as exc:
-            self.log(f"HaMeR 实机接管前状态检查失败：{exc}")
-            return
-
-        home_deg = sim_rad_to_real_deg(core.HOME_Q_RAD)
-        if not messagebox.askyesno(
-            "HaMeR 实机同步 · 第一次确认",
-            "将冻结 HaMeR 仿真目标，并让实体 CR3 与 MuJoCo 自动回到统一 Home。\n\n"
-            f"当前实机关节: {np.round(state.joints_deg, 2).tolist()}°\n"
-            f"目标 Home: {np.round(home_deg, 2).tolist()}°\n"
-            f"回 Home 限速: {HAMER_REAL_HOME_SPEED_DEG_S:.1f} deg/s\n\n"
-            "确认工作区安全并开始低速回 Home 吗？",
-            icon="warning",
-        ):
-            self.log("用户取消了 HaMeR 实机同步第一次确认。")
-            return
-
-        # Alignment is part of the handover now; the user no longer has to
-        # remember to press the separate alignment button.
-        self._set_sim_from_real(state.joints_deg)
-        self.real_stop_event = threading.Event()
-        self.hamer_real_stage = "homing"
-        self.hamer_real_confirm_until = 0.0
-        self.q_target = core.HOME_Q_RAD.copy()
-        self._set_button_text(self.hamer_real_preview_button, "停止回 Home")
-        self.hamer_status_var.set("HaMeR 实机准备 · 仿真与实机正在回统一 Home")
-        self.status_var.set("HAMER REAL HOMING")
-        self.log("第一次确认完成：已按 30004 自动对齐，正在以 5°/s 回统一 Home。")
-        def work():
-            hardware = LiveServoHardware(
-                robot_ip,
-                max_joint_speed_deg_s=HAMER_REAL_HOME_SPEED_DEG_S,
-                feedback=self.monitor,
-            )
-            try:
-                hardware.connect()
-                return stream_live_target_until_reached(
-                    hardware,
-                    home_deg,
-                    stop_event=self.real_stop_event,
-                )
-            finally:
-                hardware.close()
-
-        self._background(work, self._hamer_real_home_complete, self._hamer_real_failed)
-
-    def _hamer_real_home_complete(self, state) -> None:
-        if self.hamer_real_stage != "homing" or self.estop_latched:
-            return
-        self._set_sim_home_now()
-        self.hamer_real_stage = "waiting_origin"
-        self.hamer_real_origin_after_sequence = (
-            0 if self.hamer_tracker is None else self.hamer_tracker.get().sequence
-        )
-        self._set_button_text(self.hamer_real_preview_button, "等待手部原点…")
-        self.hamer_status_var.set("实机与 MuJoCo 已到 Home · 等待下一帧有效手部并自动归零")
-        self.status_var.set("HAMER REAL WAITING ORIGIN")
-        self.log(
-            "实体 CR3 和 MuJoCo 已到统一 Home；验证阶段的仿真偏移已丢弃。"
-            "下一帧有效 HaMeR 手位将自动成为新的实机控制原点。"
-        )
-
-    def _set_hamer_real_home_origin(self, cam_t: np.ndarray) -> None:
-        home_ee = self._set_sim_home_now()
-        self.hamer_mapper.calibrate(cam_t, home_ee)
-        self.hamer_last_valid_hand_at = time.monotonic()
-        self.hamer_real_stage = "ready"
-        self.hamer_real_confirm_until = (
-            time.monotonic() + HAMER_REAL_CONFIRMATION_WINDOW_S
-        )
-        self._set_button_text(
-            self.hamer_real_preview_button,
-            "最终确认 HaMeR 实机同步",
-        )
-        self.hamer_status_var.set("Home 原点已重建 · 30 秒内进行第二次确认")
-        self.status_var.set("HAMER REAL READY")
-        self.log(
-            "HaMeR 实机原点已自动重建："
-            f"cam_t={np.round(cam_t, 4).tolist()}，"
-            f"Home Link6={np.round(home_ee, 4).tolist()}。"
-        )
-
-    def confirm_hamer_real_sync(self) -> None:
-        """Second confirmation: reconnect 30003 and begin continuous ServoJ."""
-        now = time.monotonic()
-        if self.hamer_real_stage != "ready":
-            return
-        if now > self.hamer_real_confirm_until:
-            self.stop_hamer_real_sync("HaMeR 实机同步第二次确认已超时，请重新准备。")
-            return
-        if self.monitor is None or self.hamer_tracker is None:
-            self.stop_hamer_real_sync("HaMeR 实机同步准备失效：反馈或摄像头已断开。")
-            return
-        try:
-            state = self.monitor.require_fresh(max_age=0.5)
-            require_motion_ready(state)
-            home_deg = sim_rad_to_real_deg(core.HOME_Q_RAD)
-            if not joint_target_reached(state, home_deg):
-                raise RuntimeError("实体 CR3 已离开 Home 或仍在运动")
-            snapshot = self.hamer_tracker.get()
-            cam_t = hamer_cam_t(snapshot.result)
-            if cam_t is None:
-                raise RuntimeError("当前没有有效手部 cam_t")
-        except Exception as exc:
-            self.log(f"HaMeR 实机同步最终检查失败：{exc}")
-            return
-        robot_ip = self._active_robot_ip()
-        if robot_ip is None:
-            return
-        if not messagebox.askyesno(
-            "HaMeR 实机同步 · 最终确认",
-            "实体 CR3 与 MuJoCo 已在统一 Home，当前手位将再次归零。\n\n"
-            f"IP: {robot_ip}\n"
-            f"实机连续 ServoJ 限速: {HAMER_REAL_HOME_SPEED_DEG_S:.1f} deg/s\n"
-            f"手部丢失保护: {HAMER_REAL_HAND_WATCHDOG_S:.1f} s\n\n"
-            "确认开始由 HaMeR 控制实体机械臂吗？",
-            icon="warning",
-        ):
-            self.log("用户取消了 HaMeR 实机同步最终确认。")
-            return
-
-        # The modal confirmation can remain open for an arbitrary time. Read
-        # both robot and hand again after it closes instead of using the values
-        # that were checked before the dialog.
-        try:
-            state = self.monitor.require_fresh(max_age=0.5)
-            require_motion_ready(state)
-            if not joint_target_reached(state, home_deg):
-                raise RuntimeError("最终确认期间实体 CR3 离开了 Home")
-            snapshot = self.hamer_tracker.get()
-            cam_t = hamer_cam_t(snapshot.result)
-            if cam_t is None:
-                raise RuntimeError("最终确认后没有有效手部 cam_t")
-            hand_age = time.monotonic() - snapshot.result_at
-            if snapshot.result_at <= 0.0 or hand_age > HAMER_REAL_HAND_WATCHDOG_S:
-                raise RuntimeError(f"最终确认后的手部结果已过期（{hand_age:.2f}s）")
-        except Exception as exc:
-            self.log(f"HaMeR 实机同步未启动：{exc}")
-            return
-
-        # Re-zero once more at the exact handover moment, guaranteeing the
-        # first real target is Home even if the hand moved after validation.
-        now = time.monotonic()
-        home_ee = self._set_sim_home_now()
-        self.hamer_mapper.calibrate(cam_t, home_ee)
-        self.hamer_last_valid_hand_at = (
-            snapshot.result_at if snapshot.result_at > 0.0 else now
-        )
-        self.hamer_real_stage = "connecting"
-        self.hamer_real_confirm_until = 0.0
-        self.real_stop_event = threading.Event()
-        self._set_button_text(self.hamer_real_preview_button, "停止 HaMeR 实机同步")
-        self.hamer_status_var.set("最终确认完成 · 正在连接 30003")
-        self.status_var.set("HAMER REAL CONNECTING")
-        def work():
-            hardware = LiveServoHardware(
-                robot_ip,
-                max_joint_speed_deg_s=HAMER_REAL_HOME_SPEED_DEG_S,
-                feedback=self.monitor,
-            )
-            try:
-                connected_state = hardware.connect()
-                if not joint_target_reached(connected_state, home_deg):
-                    raise RuntimeError("30003 连接完成时实体 CR3 已不在 Home")
-                return hardware, connected_state
-            except Exception:
-                hardware.close()
-                raise
-
-        self._background(work, self._hamer_real_connected, self._hamer_real_failed)
-
-    def _hamer_real_connected(self, result) -> None:
-        hardware, state = result
-        if self.hamer_real_stage != "connecting" or self.estop_latched:
-            hardware.close()
-            return
-        self.live_hardware = hardware
-        self.last_applied_live_speed = hardware.max_joint_speed_deg_s
-        self.hamer_real_stage = "active"
-        self._set_sim_from_real(state.joints_deg)
-        self.q_target = core.HOME_Q_RAD.copy()
-        hardware.start_stream(sim_rad_to_real_deg(self.q_target))
-        self.hamer_status_var.set("HaMeR 实机同步 ACTIVE · 5°/s ServoJ · 手部丢失自动停止")
-        self.status_var.set("HAMER REAL SYNC ACTIVE")
-        self.log("HaMeR 实机同步已启动；当前控制链为 HaMeR → MuJoCo IK → CR3 ServoJ。")
-
-    def stop_hamer_real_sync(self, reason: str | None = None) -> None:
-        previous_stage = self.hamer_real_stage
-        self.real_stop_event.set()
-        self.hamer_real_stage = "idle"
-        self.hamer_real_confirm_until = 0.0
-        hardware = None
-        if previous_stage == "active" and self.live_hardware is not None:
-            hardware = self.live_hardware
-            self.live_hardware = None
-            self.last_applied_live_speed = None
-        if hasattr(self, "hamer_real_preview_button"):
-            self._set_button_text(self.hamer_real_preview_button, "HaMeR 实机同步")
-        if hardware is not None:
-            self._background(hardware.close, lambda _=None: None, lambda exc: self.log(f"关闭 HaMeR 30003 失败：{exc}"))
-        if previous_stage != "idle":
-            self.status_var.set("HAMER SIM READY")
-        if reason:
-            self.log(reason)
-
-    # Compatibility with older call sites while the button name has changed.
-    def stop_hamer_real_preview(self, reason: str | None = None) -> None:
-        self.stop_hamer_real_sync(reason)
-
-    def _hamer_real_failed(self, exc: Exception) -> None:
-        self.stop_hamer_real_sync()
-        self.hamer_status_var.set(f"HaMeR 实机同步已中止：{exc}")
-        self.status_var.set("HAMER REAL SYNC FAILED")
-        self.log(f"HaMeR 实机同步已中止：{exc}")
-
-    def _check_hamer_real_sync(self, now: float) -> None:
-        if self.hamer_real_stage == "ready" and now > self.hamer_real_confirm_until:
-            self.stop_hamer_real_sync("HaMeR 实机同步第二次确认已超时。")
-            return
-        if self.hamer_real_stage != "active":
-            return
-        if now - self.hamer_last_valid_hand_at > HAMER_REAL_HAND_WATCHDOG_S:
-            self.stop_hamer_real_sync(
-                f"HaMeR 有效手部数据超过 {HAMER_REAL_HAND_WATCHDOG_S:.1f}s 未更新，实机发送已停止。"
-            )
-
-    def setup_hamer_origin_video(self) -> None:
-        """First press opens the video; second press confirms its current frame."""
-        if self.hamer_phase == "origin_video":
-            self.confirm_hamer_origin_frame()
-            return
-        if self.hamer_phase == "origin_starting":
-            self.log("原点视频正在打开，请稍候再按第二次。")
-            return
-        if self.real_busy or self.teach_active or self.teach_starting:
-            self.log("真实回放或示教拖拽活动时不能设置 HaMeR 原点。")
-            return
-        if self.live_hardware is not None or self.live_starting:
-            self.log("请先停止实时实机同步；HaMeR 当前仅控制 MuJoCo。")
-            return
-        if self.hamer_phase in ("live_starting", "live_wait_origin", "live"):
-            self.log("请先停止 HaMeR 实时仿真，再重新设置原点。")
-            return
-        if self.hamer_phase == "origin_validation":
-            self.log("原点验证视频正在控制 MuJoCo，请等待播放完成。")
-            return
-        if self.hamer_starting or self.hamer_tracker is not None:
-            self.log("原点设置视频已在处理。")
-            return
-        try:
-            mapper = self._new_hamer_mapper()
-            max_ee_step = float(self.hamer_ee_step_var.get())
-            video_text = self.hamer_video_var.get().strip()
-            if not video_text:
-                raise ValueError("原点定义视频路径不能为空")
-            tracker = HamerBridgeTracker(
-                self.hamer_bridge_url_var.get(),
-                video_path=video_text,
-            )
-        except Exception as exc:
-            self.log(f"HaMeR 原点视频设置无效：{exc}")
-            return
-
-        self.mode_var.set("hamer")
-        self.hamer_mapper = mapper
-        self.hamer_max_ee_step = max_ee_step
-        self.hamer_phase = "origin_starting"
-        self.hamer_last_sequence = 0
-        self.hamer_latest_frame = None
-        self.hamer_latest_frame_sequence = 0
-        self.hamer_rendered_frame_key = None
-        if self.hamer_preview_image_id is not None:
-            self.canvas.delete(self.hamer_preview_image_id)
-            self.hamer_preview_image_id = None
-            self.hamer_preview_photo = None
-        self.hamer_starting = True
-        self._set_button_text(self.hamer_origin_button, "正在打开测试视频…")
-        self.hamer_origin_button.configure(state=tk.DISABLED)
-        self.hamer_button.configure(state=tk.DISABLED)
-        self.hamer_stop_video_button.configure(state=tk.NORMAL)
-        self.hamer_status_var.set("Testing HaMeR · 正在打开内置测试视频…")
-        self.status_var.set("HAMER ORIGIN VIDEO")
-        self.log("原点视频正在打开；画面出现后，第二次点击同一按钮确定当前帧为原点。")
-
-        def work():
-            tracker.start()
-            return tracker
-
-        self._background(work, self._hamer_started, self._hamer_start_failed)
-
-    def start_hamer(self) -> None:
-        """Compatibility alias for the GUI's HaMeR live mode."""
-        self.start_hamer_live()
-
-    def start_hamer_live(self) -> None:
-        if self.real_busy or self.teach_active or self.teach_starting:
-            self.log("真实回放或示教拖拽活动时不能启动 HaMeR 实时仿真。")
-            return
-        if self.live_hardware is not None or self.live_starting:
-            self.log("请先停止实时实机同步；HaMeR 实时模式当前仅控制 MuJoCo。")
-            return
-        if self.hamer_starting or self.hamer_tracker is not None:
-            return
-        try:
-            mapper = self._new_hamer_mapper()
-            max_ee_step = float(self.hamer_ee_step_var.get())
-            camera_id = int(self.hamer_camera_id_var.get())
-            tracker = HamerBridgeTracker(
-                self.hamer_bridge_url_var.get(),
-                video_path=None,
-                camera_id=camera_id,
-            )
-        except Exception as exc:
-            self.log(f"HaMeR 实时设置无效：{exc}")
-            return
-
-        self.mode_var.set("hamer")
-        self.hamer_mapper = mapper
-        self.hamer_max_ee_step = max_ee_step
-        self.hamer_phase = "live_starting"
-        self.hamer_last_sequence = 0
-        self.hamer_latest_frame = None
-        self.hamer_latest_frame_sequence = 0
-        self.hamer_rendered_frame_key = None
-        self.hamer_starting = True
-        self._set_button_text(self.hamer_button, "正在打开摄像头…")
-        self.hamer_button.configure(state=tk.DISABLED)
-        self.hamer_origin_button.configure(state=tk.DISABLED)
-        self.hamer_stop_video_button.configure(state=tk.DISABLED)
-        self.hamer_status_var.set("HaMeR 正在启动实时摄像头 · 启动后按 R 设定原点")
-        self.status_var.set("STARTING HAMER LIVE SIM")
-
-        def work():
-            tracker.start()
-            return tracker
-
-        self._background(work, self._hamer_started, self._hamer_start_failed)
-
-    def _hamer_started(self, tracker: HamerBridgeTracker) -> None:
-        if not self.hamer_starting or self.mode_var.get() != "hamer":
-            tracker.stop()
-            return
-        self.hamer_starting = False
-        self.hamer_tracker = tracker
-        if self.hamer_phase == "origin_starting":
-            self.hamer_phase = "origin_video"
-            self.hamer_origin_button.configure(
-                text="确定测试帧",
-                state=tk.NORMAL,
-            )
-            self.hamer_button.configure(state=tk.DISABLED)
-            self.hamer_stop_video_button.configure(state=tk.NORMAL)
-            self.hamer_status_var.set("Testing HaMeR · 选择合适画面后再点击同一按钮开始验证")
-            self.status_var.set("HAMER ORIGIN PREVIEW")
-        elif self.hamer_phase == "live_starting":
-            self.hamer_phase = "live_wait_origin"
-            self._set_button_text(self.hamer_button, "停止 HaMeR 实时")
-            self.hamer_button.configure(state=tk.NORMAL)
-            self.hamer_origin_button.configure(state=tk.DISABLED)
-            self.hamer_stop_video_button.configure(state=tk.DISABLED)
-            self.hamer_status_var.set("HaMeR 实时摄像头已启动 · 请按 R 设定当前手位为原点")
-            self.status_var.set("HAMER LIVE WAITING FOR R")
-            self.log("HaMeR 实时摄像头已启动；按 R 之前只显示画面，不移动 MuJoCo。")
-        else:
-            tracker.stop()
-            self.hamer_tracker = None
-
-    def _hamer_start_failed(self, exc: Exception) -> None:
-        failed_phase = self.hamer_phase
-        self.hamer_starting = False
-        self.hamer_tracker = None
-        if failed_phase in ("origin_starting", "live_starting"):
-            self.hamer_mapper.clear_origin()
-        self.hamer_phase = "idle"
-        self._set_button_text(self.hamer_button, "HaMeR 实时仿真")
-        self.hamer_button.configure(state=tk.NORMAL)
-        self._set_button_text(self.hamer_origin_button, "Testing HaMeR")
-        self.hamer_origin_button.configure(state=tk.NORMAL)
-        self.hamer_stop_video_button.configure(state=tk.DISABLED)
-        self.hamer_status_var.set(f"HaMeR 启动失败：{exc}")
-        self.status_var.set("HAMER START FAILED")
-        self.log(f"HaMeR 启动失败：{exc}")
-
-    def stop_hamer(self, *, clear_origin: bool = False) -> None:
-        self.stop_hamer_real_preview()
-        previous_phase = self.hamer_phase
-        self.hamer_starting = False
-        tracker = self.hamer_tracker
-        self.hamer_tracker = None
-        if clear_origin:
-            self.hamer_mapper.clear_origin()
-        self.hamer_phase = "idle"
-        self.hamer_latest_frame = None
-        self.hamer_latest_frame_sequence = 0
-        self.hamer_rendered_frame_key = None
-        self.hamer_last_sequence = 0
-        self._set_button_text(self.hamer_button, "HaMeR 实时仿真")
-        self.hamer_button.configure(state=tk.NORMAL)
-        self._set_button_text(self.hamer_origin_button, "Testing HaMeR")
-        self.hamer_origin_button.configure(state=tk.NORMAL)
-        self.hamer_stop_video_button.configure(state=tk.DISABLED)
-        self.hamer_status_var.set("Testing HaMeR=测试视频 · 实时摄像头中按 R 设定原点")
-        if self.hamer_preview_image_id is not None:
-            self.canvas.delete(self.hamer_preview_image_id)
-            self.hamer_preview_image_id = None
-            self.hamer_preview_photo = None
-        if tracker is not None:
-            self._background(tracker.stop, lambda _=None: None, lambda exc: self.log(f"HaMeR 停止异常：{exc}"))
-        if previous_phase in ("live", "live_wait_origin", "live_starting"):
-            self.status_var.set("HAMER LIVE STOPPED")
-            self.log("HaMeR 实时仿真已停止。")
-
-    def stop_hamer_test_video(self) -> None:
-        if self.hamer_phase not in ("origin_starting", "origin_video", "origin_validation"):
-            self.log("当前没有正在播放的 Testing HaMeR 视频。")
-            return
-        self.stop_hamer(clear_origin=True)
-        self.status_var.set("HAMER TEST VIDEO STOPPED")
-        self.hamer_status_var.set("Testing HaMeR 视频已停止 · 可重新测试或启动实时摄像头")
-        self.log("Testing HaMeR 视频已手动停止；MuJoCo 保持当前位姿。")
-
-    def set_hamer_origin(self) -> None:
-        """Compatibility alias for setting the live-camera origin."""
-        self.set_hamer_camera_origin()
-
-    def set_hamer_camera_origin(self) -> None:
-        """Bind the current live-camera hand pose to the current MuJoCo Link6."""
-        tracker = self.hamer_tracker
-        if tracker is None or self.hamer_phase not in ("live_wait_origin", "live"):
-            self.log("请先启动“HaMeR 实时仿真”，然后在摄像头画面中按 R 设定原点。")
-            return
-        snapshot = tracker.get()
-        cam_t = hamer_cam_t(snapshot.result)
-        if cam_t is None:
-            latency = (
-                f"{snapshot.request_latency_s:.1f}s"
-                if snapshot.request_latency_s > 0.0
-                else "尚无返回"
-            )
-            self.log(
-                "实时摄像头当前没有有效手部 cam_t；"
-                f"桥接状态：{snapshot.status}；最近推理耗时：{latency}。"
-            )
-            self.hamer_status_var.set(
-                f"尚未取得 cam_t · {snapshot.status} · 推理 {latency}"
-            )
-            return
-        current_q = self.data.qpos[self.arm_qpos_indices].copy()
-        self.q_target = current_q
-        ee_pos = self.data.xpos[self.end_effector_id].copy()
-        self.hamer_mapper.calibrate(cam_t, ee_pos)
-        self.hamer_phase = "live"
-        self.hamer_last_sequence = snapshot.sequence
-        self.hamer_status_var.set("HaMeR LIVE · 摄像头原点已设定 · 按 R 可随时重新归零")
-        self.status_var.set("HAMER LIVE TRACKING")
-        self.log(
-            "HaMeR 实时摄像头原点已设定："
-            f"cam_t={np.round(cam_t, 4).tolist()}  Link6={np.round(ee_pos, 4).tolist()}"
-        )
-
-    def confirm_hamer_origin_frame(self) -> None:
-        """Use the currently displayed origin-video frame as the origin."""
-        tracker = self.hamer_tracker
-        if tracker is None or self.hamer_phase != "origin_video":
-            self.log("请先点击“原点设置视频”打开视频。")
-            return
-        snapshot = tracker.get()
-        cam_t = hamer_cam_t(snapshot.result)
-        if cam_t is None:
-            latency = (
-                f"{snapshot.request_latency_s:.1f}s"
-                if snapshot.request_latency_s > 0.0
-                else "尚无返回"
-            )
-            self.log(
-                "当前视频帧没有有效手部 cam_t；"
-                f"桥接状态：{snapshot.status}；最近推理耗时：{latency}。"
-            )
-            self.hamer_status_var.set(
-                f"当前帧无 cam_t · {snapshot.status} · 推理 {latency}"
-            )
-            return
-        current_q = self.data.qpos[self.arm_qpos_indices].copy()
-        self.q_target = current_q
-        ee_pos = self.data.xpos[self.end_effector_id].copy()
-        self.hamer_mapper.calibrate(cam_t, ee_pos)
-        self.hamer_phase = "origin_validation"
-        self.hamer_last_sequence = snapshot.sequence
-        self._set_button_text(self.hamer_button, "HaMeR 实时仿真")
-        self.hamer_button.configure(state=tk.DISABLED)
-        self._set_button_text(self.hamer_origin_button, "原点已确定 · 验证中")
-        self.hamer_origin_button.configure(state=tk.DISABLED)
-        self.hamer_status_var.set("HaMeR 原点已确定 · 原点视频继续控制 MuJoCo 验证映射")
-        self.status_var.set("HAMER ORIGIN VIDEO VALIDATION")
-        self.log(
-            "HaMeR 原点已由第二次按键时的视频帧确定："
-            f"cam_t={np.round(cam_t, 4).tolist()}  Link6={np.round(ee_pos, 4).tolist()}"
-        )
-        self.log("原点视频将继续播放；后续手部位移现在会直接驱动 MuJoCo 机械臂。")
-
-    def _update_hamer(self, now: float) -> None:
-        tracker = self.hamer_tracker
-        if tracker is None or self.mode_var.get() != "hamer" or now < self.hamer_next_poll:
-            return
-        self.hamer_next_poll = now + 1.0 / 30.0
-        snapshot = tracker.get()
-        self.hamer_latest_frame = snapshot.frame_bgr
-        self.hamer_latest_frame_sequence = snapshot.frame_sequence
-        if self.manual_home_active:
-            self.hamer_last_sequence = snapshot.sequence
-            return
-        if snapshot.status != self.hamer_last_status:
-            self.hamer_last_status = snapshot.status
-        if snapshot.sequence == self.hamer_last_sequence:
-            if not tracker.running and "ended" in snapshot.status.lower():
-                if self.hamer_phase == "origin_video":
-                    self.hamer_tracker = None
-                    self.hamer_phase = "idle"
-                    self.hamer_mapper.clear_origin()
-                    self._set_button_text(self.hamer_button, "HaMeR 实时仿真")
-                    self.hamer_button.configure(state=tk.NORMAL)
-                    self._set_button_text(self.hamer_origin_button, "Testing HaMeR")
-                    self.hamer_origin_button.configure(state=tk.NORMAL)
-                    self.hamer_stop_video_button.configure(state=tk.DISABLED)
-                    self.hamer_status_var.set("Testing HaMeR 视频已结束，但尚未选择测试原点 · 可重试")
-                elif self.hamer_phase == "origin_validation":
-                    self.hamer_tracker = None
-                    self.hamer_phase = "idle"
-                    self.hamer_mapper.clear_origin()
-                    self._set_button_text(self.hamer_button, "HaMeR 实时仿真")
-                    self.hamer_button.configure(state=tk.NORMAL)
-                    self._set_button_text(self.hamer_origin_button, "Testing HaMeR")
-                    self.hamer_origin_button.configure(state=tk.NORMAL)
-                    self.hamer_stop_video_button.configure(state=tk.DISABLED)
-                    self.hamer_status_var.set("Testing HaMeR 验证视频已播放完 · 可启动实时摄像头")
-                    self.status_var.set("HAMER TEST COMPLETE")
-                    self.log("Testing HaMeR 验证已完成；MuJoCo 保持最终位姿。")
-                else:
-                    self.hamer_status_var.set("HaMeR 实时画面已停止 · MuJoCo 保持当前位姿")
-                if self.hamer_tracker is None:
-                    self._background(
-                        tracker.stop,
-                        lambda _=None: None,
-                        lambda exc: self.log(f"HaMeR 视频释放异常：{exc}"),
-                    )
-            return
-        self.hamer_last_sequence = snapshot.sequence
-        cam_t = hamer_cam_t(snapshot.result)
-        if cam_t is None:
-            if self.hamer_real_stage == "homing":
-                self.hamer_status_var.set("HaMeR 实机准备 · 仿真与实机正在回统一 Home")
-            elif self.hamer_real_stage == "waiting_origin":
-                self.hamer_status_var.set("实机与 MuJoCo 已到 Home · 等待有效手部并自动归零")
-            elif self.hamer_real_stage in ("ready", "connecting"):
-                self.hamer_status_var.set("Home 已建立 · 当前手部暂时丢失，尚未发送运动")
-            elif self.hamer_phase == "origin_video":
-                self.hamer_status_var.set("原点视频预览中 · 当前帧未检测到手部")
-            elif self.hamer_phase == "origin_validation":
-                self.hamer_status_var.set("原点视频验证中 · 当前帧未检测到有效手部")
-            elif self.hamer_phase == "live_wait_origin":
-                self.hamer_status_var.set("HaMeR 实时摄像头已启动 · 等待检测手部后按 R 设定原点")
-            else:
-                self.hamer_status_var.set(f"HaMeR LIVE · 未检测到有效手部 · {snapshot.status}")
-            return
-        self.hamer_last_valid_hand_at = (
-            snapshot.result_at if snapshot.result_at > 0.0 else now
-        )
-        if (
-            self.hamer_real_stage == "waiting_origin"
-            and snapshot.sequence > self.hamer_real_origin_after_sequence
-        ):
-            self._set_hamer_real_home_origin(cam_t)
-            return
-        if self.hamer_real_stage == "waiting_origin":
-            return
-        if self.hamer_real_stage in ("homing", "ready", "connecting"):
-            # Hold both sides exactly at Home until the final confirmation.
-            self.q_target = core.HOME_Q_RAD.copy()
-            return
-        if self.hamer_phase == "origin_video":
-            self.hamer_status_var.set("原点视频已检测到手部 · 再点击同一按钮确定当前帧为原点")
-            return
-        if self.hamer_phase == "live_wait_origin":
-            self.hamer_status_var.set("HaMeR 实时摄像头已检测到手部 · 按 R 设定当前手位为原点")
-            return
-        if self.hamer_phase not in ("live", "origin_validation") or not self.hamer_mapper.calibrated:
-            return
-        target_pos = self.hamer_mapper.target_pos(cam_t)
-        ee_pos = self.data.xpos[self.end_effector_id].copy()
-        position_error = target_pos - ee_pos
-        error_norm = float(np.linalg.norm(position_error))
-        if error_norm > self.hamer_max_ee_step:
-            position_error *= self.hamer_max_ee_step / error_norm
-        twist = np.zeros(6)
-        twist[:3] = position_error
-        current_q = self.data.qpos[self.arm_qpos_indices].copy()
-        self.q_target = core.apply_cartesian_increment(
-            self.model,
-            self.data,
-            self.end_effector_id,
-            self.arm_dof_indices,
-            self.arm_joint_ids,
-            current_q,
-            twist,
-        )
-        delta = target_pos - self.hamer_mapper.ee_origin
-        source_text = "原点视频验证" if self.hamer_phase == "origin_validation" else "HaMeR LIVE"
-        control_text = (
-            "实体 CR3 同步 ACTIVE"
-            if self.hamer_real_stage == "active"
-            else "仅 MuJoCo"
-        )
-        self.hamer_status_var.set(
-            f"{source_text} · {control_text} · "
-            f"ΔXYZ={np.round(delta * 1000.0, 1).tolist()} mm"
         )
 
     def open_quest_settings(self) -> None:
@@ -4069,10 +3290,36 @@ class CR3ControlGUI:
     def _quest_target_rotation(self, snapshot) -> np.ndarray | None:
         if not self.quest_orientation_mode_var.get():
             return None
-        # Quest now uses a fixed, calibrated horizontal tool pose.  The wrist
-        # quaternion remains available in the receiver for diagnostics, but
-        # does not rotate the real or simulated end effector.
+        # Lock the tool orientation to the Home that matches the selected
+        # Quest motion mode.  The wrist quaternion remains available in the
+        # receiver for diagnostics, but does not rotate the end effector.
+        if self._quest_home_rotation is not None:
+            return self._quest_home_rotation.copy()
         return core.QUEST_HOME_ROTATION.copy()
+
+    def _on_quest_motion_mode_changed(self) -> None:
+        mode = self.quest_motion_mode_var.get()
+        if mode not in (QUEST_MOTION_MODE_ORIGINAL, QUEST_MOTION_MODE_REVERSED_END):
+            mode = QUEST_MOTION_MODE_ORIGINAL
+            self.quest_motion_mode_var.set(mode)
+        self.quest_mapper.set_motion_mode(mode)
+        if self.quest_receiver is not None and self.quest_mapper.calibrated:
+            # Changing transverse signs while an origin is active can create
+            # an immediate Cartesian jump.  Force an explicit re-zero instead.
+            self.quest_mapper.clear_origin()
+            self.quest_phase = "wait_origin"
+            self.log("Quest 映射已改变；为防止跳变，请按 R 重新设定腕部原点。")
+        if mode == QUEST_MOTION_MODE_REVERSED_END:
+            self.log(
+                "Quest 已切换为反向末端 XYZ：保留前后方向，Y/Z 相对原本映射翻转。"
+                "对应水平工具 Quest Home（J1≈180°）。"
+            )
+        else:
+            self.log(
+                "Quest 已切换为原本基座 XYZ 映射。"
+                "对应通用 Home（J1=0°）。"
+            )
+        self.log("Quest Home 已随映射模式改变；如需切换，请重新按“到 Quest Home”。")
 
     def _on_quest_orientation_toggle(self) -> None:
         if not self.quest_orientation_mode_var.get():
@@ -4094,12 +3341,9 @@ class CR3ControlGUI:
             self.real_busy
             or self.teach_active
             or self.live_hardware is not None
-            or self.hamer_real_stage != "idle"
         ):
             self.log("实机回放、实时同步或示教活动时不能启动 Quest 仿真。")
             return
-        if self.hamer_tracker is not None or self.hamer_starting:
-            self.stop_hamer()
         self.mode_var.set("quest")
         self.on_mode_changed()
         try:
@@ -4123,6 +3367,7 @@ class CR3ControlGUI:
                 ema_alpha=slow_alpha,
                 fast_ema_alpha=fast_alpha,
                 filter_reference_hz=QUEST_CONTROL_RATE_HZ,
+                motion_mode=self.quest_motion_mode_var.get(),
             )
             receiver = QuestHandReceiver(
                 protocol=self.quest_protocol_var.get(),
@@ -4150,10 +3395,16 @@ class CR3ControlGUI:
             f"Quest {receiver.protocol.upper()} 正在监听 "
             f"{receiver.host}:{receiver.port}，控制手={self.quest_hand_var.get()}。"
         )
-        self.log("Quest 仿真已先到水平工具 Home；按 R 后开始 XYZ 控制。")
+        home_text = (
+            "水平工具 Quest Home（J1≈180°）"
+            if self.quest_motion_mode_var.get() == QUEST_MOTION_MODE_REVERSED_END
+            else "通用 Home（J1=0°）"
+        )
+        self.log(f"Quest 仿真已先到{home_text}；按 R 后开始 XYZ 控制。")
         self.log("Quest 实时接收已启动；按 R 前只显示腕部数据，不跟随腕部移动。")
 
     def stop_quest(self, *, clear_origin: bool = True) -> None:
+        self.stop_quest_hand_follower()
         self.stop_quest_real_sync()
         receiver = self.quest_receiver
         self.quest_receiver = None
@@ -4167,6 +3418,129 @@ class CR3ControlGUI:
         self.quest_status_var.set("Quest 未启动 · 仅控制 MuJoCo")
         if receiver is not None:
             self.log("Quest 接收已停止。")
+
+    def toggle_quest_hand_follower(self) -> None:
+        if self.quest_hand_process is not None and self.quest_hand_process.poll() is None:
+            self.stop_quest_hand_follower()
+        else:
+            self.start_quest_hand_follower()
+
+    def start_quest_hand_follower(self) -> None:
+        """Start the CRAFT hand follower while the GUI keeps Quest port 9000.
+
+        Quest sends one UDP stream.  The CR3 GUI remains the owner of port 9000
+        and relays the raw packets to the CRAFT follower on localhost:9001, so
+        wrist/landmark parsing and arm control continue in the same process.
+        """
+        receiver = self.quest_receiver
+        if receiver is None:
+            self.log("请先启动 Quest 接收，再启动 CRAFT 手部跟随。")
+            return
+        if not CRAFT_HAND_PYTHON.is_file() or not CRAFT_HAND_SCRIPT.is_file():
+            self.log(
+                f"未找到 CRAFT streamer：{CRAFT_HAND_PYTHON} 或 {CRAFT_HAND_SCRIPT}"
+            )
+            return
+        if self.quest_hand_process is not None and self.quest_hand_process.poll() is None:
+            return
+        command = [
+            str(CRAFT_HAND_PYTHON),
+            str(CRAFT_HAND_SCRIPT),
+            "--protocol",
+            "udp",
+            "--listen-host",
+            "127.0.0.1",
+            "--listen-port",
+            str(QUEST_HAND_RELAY_PORT),
+            "--hand",
+            self.quest_hand_var.get(),
+            "--status-hz",
+            "2",
+        ]
+        if self.quest_hand_live_var.get():
+            command.append("--live")
+        try:
+            receiver.set_relay(("127.0.0.1", QUEST_HAND_RELAY_PORT))
+            self.quest_hand_process = subprocess.Popen(
+                command,
+                cwd=str(CRAFT_HAND_REPO / "python"),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except (OSError, ValueError) as exc:
+            receiver.set_relay(None)
+            self.quest_hand_process = None
+            self.log(f"Quest CRAFT 手部跟随启动失败：{exc}")
+            return
+        process = self.quest_hand_process
+        self.quest_hand_relay_enabled = True
+        self._set_button_text(self.quest_hand_button, "停止 Quest 手部跟随")
+        output = "实机输出" if self.quest_hand_live_var.get() else "预览"
+        self.log(
+            f"Quest CRAFT 手部跟随已启动（{output}）；Quest 数据通过本地端口 "
+            f"127.0.0.1:{QUEST_HAND_RELAY_PORT} 转发。"
+        )
+
+        def read_output() -> None:
+            if process.stdout is None:
+                return
+            for line in process.stdout:
+                message = line.rstrip()
+                if message:
+                    self.ui_events.put((self.log, f"[CRAFT] {message}"))
+
+        self.quest_hand_output_thread = threading.Thread(
+            target=read_output,
+            name="quest-craft-output",
+            daemon=True,
+        )
+        self.quest_hand_output_thread.start()
+
+    def stop_quest_hand_follower(self) -> None:
+        process = self.quest_hand_process
+        self.quest_hand_process = None
+        if self.quest_receiver is not None:
+            self.quest_receiver.set_relay(None)
+        self.quest_hand_relay_enabled = False
+        if hasattr(self, "quest_hand_button"):
+            self._set_button_text(
+                self.quest_hand_button,
+                self._tr("启动 Quest 手部跟随", "Start Quest hand follower"),
+            )
+        if process is None:
+            return
+        if process.poll() is None:
+            try:
+                process.terminate()
+                process.wait(timeout=2.0)
+            except (OSError, subprocess.TimeoutExpired):
+                try:
+                    process.kill()
+                except OSError:
+                    pass
+        self.log("Quest CRAFT 手部跟随已停止。")
+
+    def _check_quest_hand_follower(self) -> None:
+        process = self.quest_hand_process
+        if process is None:
+            return
+        return_code = process.poll()
+        if return_code is None:
+            return
+        self.quest_hand_process = None
+        self.quest_hand_relay_enabled = False
+        if self.quest_receiver is not None:
+            self.quest_receiver.set_relay(None)
+        self._set_button_text(
+            self.quest_hand_button,
+            self._tr("启动 Quest 手部跟随", "Start Quest hand follower"),
+        )
+        self.log(f"Quest CRAFT 手部跟随已退出（code={return_code}）。")
 
     def set_quest_origin(self) -> None:
         receiver = self.quest_receiver
@@ -4249,7 +3623,9 @@ class CR3ControlGUI:
         if self.quest_real_stage == "waiting_origin":
             return
         if self.quest_real_stage in ("homing", "ready", "connecting"):
-            self.q_target = core.QUEST_HOME_Q_RAD.copy()
+            self.q_target = core.quest_home_q_rad_for_mode(
+                self.quest_motion_mode_var.get()
+            ).copy()
             return
         wrist_mm = np.round(snapshot.wrist_position * 1000.0, 1).tolist()
         landmark_count = 0 if snapshot.landmarks is None else len(snapshot.landmarks)
@@ -4263,6 +3639,7 @@ class CR3ControlGUI:
             snapshot.wrist_position,
             timestamp=snapshot.received_at,
         )
+        self.quest_last_target_pos = target_pos.copy()
         ee_pos = self.data.xpos[self.end_effector_id].copy()
         position_error = target_pos - ee_pos
         control_dt = (
@@ -4315,6 +3692,45 @@ class CR3ControlGUI:
             f"landmarks={landmark_count} · packets={snapshot.packets_received}"
         )
 
+    def _update_quest_mocap(self, now: float) -> None:
+        """Drive the scene's Quest mocap marker from the tracked wrist pose.
+
+        Pure display: shows where the mapped wrist target sits in the robot
+        workspace and the wrist's converted orientation.  The marker never
+        feeds back into q_target or the IK path.
+        """
+        if self._quest_mocap_id is None or self._quest_mocap_geom_id is None:
+            return
+        visible = (
+            self.show_quest_mocap_var.get()
+            and self.quest_mapper.calibrated
+            and self.quest_last_target_pos is not None
+        )
+        receiver = self.quest_receiver
+        if visible:
+            if receiver is None:
+                visible = False
+            else:
+                snapshot = receiver.get(self.quest_hand_var.get())
+                visible = (
+                    snapshot.has_wrist
+                    and snapshot.wrist_quaternion is not None
+                    and now - snapshot.received_at <= 0.75
+                )
+        if visible:
+            assert self.quest_last_target_pos is not None
+            assert snapshot is not None
+            self.data.mocap_pos[self._quest_mocap_id] = self.quest_last_target_pos
+            rotation = quest_quaternion_to_robot_rotation(
+                snapshot.wrist_quaternion
+            )
+            quat = np.zeros(4)
+            mujoco.mju_mat2Quat(quat, np.asarray(rotation, dtype=float).reshape(-1))
+            self.data.mocap_quat[self._quest_mocap_id] = quat
+        self.model.geom_rgba[self._quest_mocap_geom_id, 3] = (
+            0.85 if visible else 0.0
+        )
+
     def toggle_quest_real_sync(self) -> None:
         if self.quest_real_stage == "idle":
             self.prepare_quest_real_home()
@@ -4332,9 +3748,6 @@ class CR3ControlGUI:
             return
         if self.estop_latched or self.real_busy or self.teach_active:
             self.log("软件急停、真实回放或示教拖拽活动时不能启动 Quest 实机同步。")
-            return
-        if self.hamer_real_stage != "idle":
-            self.log("另一个手部实机接管流程正在运行。")
             return
         receiver = self.quest_receiver
         if (
@@ -4372,14 +3785,23 @@ class CR3ControlGUI:
             self.log(f"参数无效：{exc}")
             return
 
-        home_deg = sim_rad_to_real_deg(core.QUEST_HOME_Q_RAD)
+        home_deg = sim_rad_to_real_deg(
+            core.quest_home_q_rad_for_mode(self.quest_motion_mode_var.get())
+        )
         if not messagebox.askyesno(
-            "Quest 实机同步 · 第一次确认",
-            "将冻结 Quest 仿真目标，并让实体 CR3 与 MuJoCo 自动回到统一 Home。\n\n"
-            f"当前实机关节: {np.round(state.joints_deg, 2).tolist()}°\n"
-            f"目标 Home: {np.round(home_deg, 2).tolist()}°\n"
-            f"回 Home 限速: {quest_speed:.2f} deg/s\n\n"
-            "确认工作区安全并开始低速回 Home 吗？",
+            self._tr("Quest 实机同步 · 第一次确认", "Quest Robot Sync · First Confirmation"),
+            self._tr(
+                "将冻结 Quest 仿真目标，并让实体 CR3 与 MuJoCo 自动回到统一 Home。\n\n"
+                f"当前实机关节: {np.round(state.joints_deg, 2).tolist()}°\n"
+                f"目标 Home: {np.round(home_deg, 2).tolist()}°\n"
+                f"回 Home 限速: {quest_speed:.2f} deg/s\n\n"
+                "确认工作区安全并开始低速回 Home 吗？",
+                "Freezes the Quest simulation target and returns the physical CR3 and MuJoCo to shared Home automatically.\n\n"
+                f"Current robot joints: {np.round(state.joints_deg, 2).tolist()}°\n"
+                f"Target Home: {np.round(home_deg, 2).tolist()}°\n"
+                f"Home return speed limit: {quest_speed:.2f} deg/s\n\n"
+                "Confirm the workspace is safe and start returning Home at low speed?",
+            ),
             icon="warning",
         ):
             self.log("用户取消了 Quest 实机同步第一次确认。")
@@ -4389,7 +3811,9 @@ class CR3ControlGUI:
         self.real_stop_event = threading.Event()
         self.quest_real_stage = "homing"
         self.quest_real_confirm_until = 0.0
-        self.q_target = core.QUEST_HOME_Q_RAD.copy()
+        self.q_target = core.quest_home_q_rad_for_mode(
+            self.quest_motion_mode_var.get()
+        ).copy()
         self._set_button_text(self.quest_real_button, "停止回 Home")
         self.quest_status_var.set("Quest 实机准备 · 仿真与实机正在回统一 Home")
         self.status_var.set("QUEST REAL HOMING")
@@ -4453,7 +3877,7 @@ class CR3ControlGUI:
         self.quest_last_valid_wrist_at = received_at
         self.quest_real_stage = "ready"
         self.quest_real_confirm_until = (
-            time.monotonic() + HAMER_REAL_CONFIRMATION_WINDOW_S
+            time.monotonic() + QUEST_REAL_CONFIRMATION_WINDOW_S
         )
         self._set_button_text(
             self.quest_real_button,
@@ -4482,7 +3906,9 @@ class CR3ControlGUI:
         try:
             state = self.monitor.require_fresh(max_age=0.5)
             require_motion_ready(state)
-            home_deg = sim_rad_to_real_deg(core.QUEST_HOME_Q_RAD)
+            home_deg = sim_rad_to_real_deg(
+                core.quest_home_q_rad_for_mode(self.quest_motion_mode_var.get())
+            )
             if not joint_target_reached(state, home_deg):
                 raise RuntimeError("实体 CR3 已离开 Home 或仍在运动")
             snapshot = receiver.get(self.quest_hand_var.get())
@@ -4509,12 +3935,19 @@ class CR3ControlGUI:
         )
 
         if not messagebox.askyesno(
-            "Quest 实机同步 · 最终确认",
-            "实体 CR3 与 MuJoCo 已在统一 Home，当前 Quest 腕部将再次归零。\n\n"
-            f"IP: {robot_ip}\n"
-            f"实机连续 ServoJ 限速: {quest_speed:.2f} deg/s\n"
-            f"腕部数据丢失保护: {HAMER_REAL_HAND_WATCHDOG_S:.1f} s\n\n"
-            f"确认开始由 Quest {quest_control_mode} 控制实体机器臂吗？",
+            self._tr("Quest 实机同步 · 最终确认", "Quest Robot Sync · Final Confirmation"),
+            self._tr(
+                "实体 CR3 与 MuJoCo 已在统一 Home，当前 Quest 腕部将再次归零。\n\n"
+                f"IP: {robot_ip}\n"
+                f"实机连续 ServoJ 限速: {quest_speed:.2f} deg/s\n"
+                f"腕部数据丢失保护: {QUEST_REAL_HAND_WATCHDOG_S:.1f} s\n\n"
+                f"确认开始由 Quest {quest_control_mode} 控制实体机器臂吗？",
+                "The physical CR3 and MuJoCo are at shared Home; the current Quest wrist will be re-zeroed.\n\n"
+                f"IP: {robot_ip}\n"
+                f"Continuous robot ServoJ speed limit: {quest_speed:.2f} deg/s\n"
+                f"Wrist-data loss protection: {QUEST_REAL_HAND_WATCHDOG_S:.1f} s\n\n"
+                f"Confirm starting Quest {quest_control_mode} control of the physical arm?",
+            ),
             icon="warning",
         ):
             self.log("用户取消了 Quest 实机同步最终确认。")
@@ -4581,7 +4014,9 @@ class CR3ControlGUI:
         self.last_applied_live_speed = hardware.max_joint_speed_deg_s
         self.quest_real_stage = "active"
         self._set_sim_from_real(state.joints_deg)
-        self.q_target = core.QUEST_HOME_Q_RAD.copy()
+        self.q_target = core.quest_home_q_rad_for_mode(
+            self.quest_motion_mode_var.get()
+        ).copy()
         hardware.start_stream(sim_rad_to_real_deg(self.q_target))
         self.quest_status_var.set(
             "Quest 实机同步 ACTIVE · "
@@ -4630,9 +4065,9 @@ class CR3ControlGUI:
             return
         if self.quest_real_stage != "active":
             return
-        if now - self.quest_last_valid_wrist_at > HAMER_REAL_HAND_WATCHDOG_S:
+        if now - self.quest_last_valid_wrist_at > QUEST_REAL_HAND_WATCHDOG_S:
             self.stop_quest_real_sync(
-                f"Quest 腕部数据超过 {HAMER_REAL_HAND_WATCHDOG_S:.1f}s 未更新，实机发送已停止。"
+                f"Quest 腕部数据超过 {QUEST_REAL_HAND_WATCHDOG_S:.1f}s 未更新，实机发送已停止。"
             )
 
     def on_mode_changed(self) -> None:
@@ -4643,26 +4078,16 @@ class CR3ControlGUI:
             return
         if selected != "live" and self.live_hardware is not None:
             self.stop_live()
-        if selected != "hamer" and (self.hamer_tracker is not None or self.hamer_starting):
-            self.stop_hamer()
         if selected != "quest" and self.quest_receiver is not None:
             self.stop_quest()
         status_by_mode = {
             "record": "RECORD_PLAYBACK",
             "live": "LIVE_SYNC",
             "teach": "TEACHING READY",
-            "hamer": "HAMER SIM READY",
             "quest": "QUEST SIM READY",
         }
         self.status_var.set(status_by_mode.get(selected, "SIMULATION READY"))
-        if selected == "hamer":
-            self.keyboard_status_var.set(
-                self._tr(
-                    "HaMeR 仿真：Testing HaMeR=视频测试 · 实时摄像头画面中按 R=设定/重设原点",
-                    "HaMeR simulation: use Testing HaMeR for video; press R in live camera to set/reset origin",
-                )
-            )
-        elif selected == "quest":
+        if selected == "quest":
             self.keyboard_status_var.set(
                 self._tr(
                     "Meta Quest 仿真：先启动接收 · 按 R 设定/重设腕部原点 · 仅控制 MuJoCo",
@@ -4720,9 +4145,13 @@ class CR3ControlGUI:
             )
             return
         if not messagebox.askyesno(
-            "进入示教拖拽",
-            "将发送 StartDrag()，机械臂会进入手动拖拽状态。\n\n"
-            "请确认负载参数正确、周围无障碍物，并用手可靠扶住机械臂或末端负载。",
+            self._tr("进入示教拖拽", "Enter Teach"),
+            self._tr(
+                "将发送 StartDrag()，机械臂会进入手动拖拽状态。\n\n"
+                "请确认负载参数正确、周围无障碍物，并用手可靠扶住机械臂或末端负载。",
+                "Sends StartDrag(); the arm enters manual drag mode.\n\n"
+                "Confirm the load parameters are correct, the area is clear, and you can firmly support the arm or end-effector load with your hand.",
+            ),
             icon="warning",
         ):
             return
@@ -4839,9 +4268,6 @@ class CR3ControlGUI:
         if self.estop_latched or self.real_busy or self.teach_active:
             self.log("软件急停、真实回放或示教拖拽活动时不能启动实时同步。")
             return
-        if self.hamer_tracker is not None or self.hamer_starting:
-            self.log("当前 HaMeR 仅允许控制 MuJoCo；请先停止 HaMeR 实时仿真再启动实时实机同步。")
-            return
         if self.quest_receiver is not None:
             self.log("Quest 仿真正在运行；请先停止 Quest 接收并切换到录制回放模式。")
             return
@@ -4865,10 +4291,15 @@ class CR3ControlGUI:
             self.log(f"参数无效：{exc}")
             return
         if not messagebox.askyesno(
-            "启动实时同步",
-            "键盘和画面点动按钮将直接控制实体 CR3。\n\n"
-            f"IP: {robot_ip}\n每轴最大速度: {max_speed:.2f} deg/s\n\n"
-            "确认工作区安全并启动吗？",
+            self._tr("启动实时同步", "Start Live Sync"),
+            self._tr(
+                "键盘和画面点动按钮将直接控制实体 CR3。\n\n"
+                f"IP: {robot_ip}\n每轴最大速度: {max_speed:.2f} deg/s\n\n"
+                "确认工作区安全并启动吗？",
+                "The keyboard and viewport jog buttons will directly control the physical CR3.\n\n"
+                f"IP: {robot_ip}\nMax speed per joint: {max_speed:.2f} deg/s\n\n"
+                "Confirm the workspace is safe and start?",
+            ),
             icon="warning",
         ):
             return
@@ -4924,9 +4355,6 @@ class CR3ControlGUI:
         self.log(f"实时同步停止：{exc}")
 
     def stop_live(self) -> None:
-        if self.hamer_real_stage != "idle":
-            self.stop_hamer_real_sync("用户通过实时同步停止了 HaMeR 实机控制。")
-            return
         if self.quest_real_stage != "idle":
             self.stop_quest_real_sync("用户通过实时同步停止了 Quest 实机控制。")
             return
@@ -4949,9 +4377,9 @@ class CR3ControlGUI:
         dt = float(np.clip(now - self.last_tick, 1e-4, 0.1))
         self.last_tick = now
         self._repeat_motion_keys(now)
-        self._update_hamer(now)
         self._update_quest(now)
-        self._check_hamer_real_sync(now)
+        self._update_quest_mocap(now)
+        self._check_quest_hand_follower()
         self._check_quest_real_sync(now)
 
         if self.armed_until > 0.0:
@@ -4965,13 +4393,9 @@ class CR3ControlGUI:
 
         try:
             if self.live_hardware is not None:
-                hand_real_active = (
-                    self.hamer_real_stage == "active"
-                    or self.quest_real_stage == "active"
-                )
                 if self.quest_real_stage == "active":
                     self._apply_quest_real_speed_setting()
-                elif not hand_real_active:
+                else:
                     self._apply_live_speed_setting()
                 requested = sim_rad_to_real_deg(self.q_target)
                 self.live_hardware.set_stream_target(requested)
@@ -5014,14 +4438,11 @@ class CR3ControlGUI:
             mujoco.mj_forward(self.model, self.data)
         except Exception as exc:
             if self.live_hardware is not None:
-                hamer_real_active = self.hamer_real_stage == "active"
                 quest_real_active = self.quest_real_stage == "active"
                 hardware = self.live_hardware
                 self.live_hardware = None
                 self._background(hardware.close, lambda _=None: None, lambda _exc: None)
-                if hamer_real_active:
-                    self._hamer_real_failed(exc)
-                elif quest_real_active:
+                if quest_real_active:
                     self._quest_real_failed(exc)
                 else:
                     self._live_failed(exc)
@@ -5064,44 +4485,9 @@ class CR3ControlGUI:
                 self.canvas.itemconfigure(
                     self.canvas_image_id, image=self.photo_image
                 )
-            self._render_hamer_preview()
         except Exception as exc:
             self.status_var.set("RENDER ERROR")
             self.log(f"MuJoCo 渲染失败：{exc}")
-
-    def _render_hamer_preview(self) -> None:
-        frame = self.hamer_latest_frame
-        if self.hamer_tracker is None or frame is None:
-            return
-        max_width = max(220, min(360, self.canvas.winfo_width() // 3))
-        max_height = max(150, min(240, self.canvas.winfo_height() // 3))
-        render_key = (self.hamer_latest_frame_sequence, max_width, max_height)
-        x = max(8, self.canvas.winfo_width() - 14)
-        if (
-            render_key == self.hamer_rendered_frame_key
-            and self.hamer_preview_image_id is not None
-        ):
-            self.canvas.coords(self.hamer_preview_image_id, x, 14)
-            self.canvas.tag_raise(self.hamer_preview_image_id)
-            return
-        image = Image.fromarray(frame[:, :, ::-1])
-        image.thumbnail((max_width, max_height), Image.Resampling.BILINEAR)
-        self.hamer_preview_photo = ImageTk.PhotoImage(image=image)
-        self.hamer_rendered_frame_key = render_key
-        if self.hamer_preview_image_id is None:
-            self.hamer_preview_image_id = self.canvas.create_image(
-                x,
-                14,
-                image=self.hamer_preview_photo,
-                anchor=tk.NE,
-            )
-        else:
-            self.canvas.coords(self.hamer_preview_image_id, x, 14)
-            self.canvas.itemconfigure(
-                self.hamer_preview_image_id,
-                image=self.hamer_preview_photo,
-            )
-            self.canvas.tag_raise(self.hamer_preview_image_id)
 
     def _refresh_robot_status(self) -> None:
         source = None
@@ -5396,8 +4782,11 @@ class CR3ControlGUI:
                 self.log("示教模式命令正在执行，请稍候再退出。")
                 return
             if not messagebox.askyesno(
-                "退出示教并关闭",
-                "关闭 GUI 前将先发送 StopDrag()，确认退出示教拖拽后再关闭。\n\n继续吗？",
+                self._tr("退出示教并关闭", "Exit Teach and Close"),
+                self._tr(
+                    "关闭 GUI 前将先发送 StopDrag()，确认退出示教拖拽后再关闭。\n\n继续吗？",
+                    "StopDrag() is sent before closing the GUI; confirm exiting drag mode, then close.\n\nContinue?",
+                ),
                 icon="warning",
             ):
                 return
@@ -5425,8 +4814,11 @@ class CR3ControlGUI:
                 self.pending_close = False
                 self._teach_stop_failed(exc)
                 messagebox.showerror(
-                    "无法确认退出示教",
-                    f"StopDrag() 失败：\n{exc}\n\nGUI 保持打开，请使用 DobotStudio 检查拖拽状态。",
+                    self._tr("无法确认退出示教", "Could Not Confirm Teach Exit"),
+                    self._tr(
+                        f"StopDrag() 失败：\n{exc}\n\nGUI 保持打开，请使用 DobotStudio 检查拖拽状态。",
+                        f"StopDrag() failed:\n{exc}\n\nThe GUI stays open; use DobotStudio to check the drag state.",
+                    ),
                 )
 
             self._background(
@@ -5438,12 +4830,14 @@ class CR3ControlGUI:
         if (
             self.real_busy
             or self.live_hardware is not None
-            or self.hamer_real_stage in ("homing", "connecting", "active")
             or self.quest_real_stage in ("homing", "connecting", "active")
         ):
             if not messagebox.askyesno(
-                "退出并急停",
-                "实体运动连接仍处于活动状态。\n退出前将发送软件 EmergencyStop。\n\n继续吗？",
+                self._tr("退出并急停", "Exit and E-stop"),
+                self._tr(
+                    "实体运动连接仍处于活动状态。\n退出前将发送软件 EmergencyStop。\n\n继续吗？",
+                    "A physical-motion connection is still active.\nA software EmergencyStop will be sent before exiting.\n\nContinue?",
+                ),
                 icon="warning",
             ):
                 return
@@ -5470,10 +4864,8 @@ class CR3ControlGUI:
         if self.live_hardware is not None:
             self.live_hardware.close()
             self.live_hardware = None
-        if self.hamer_tracker is not None:
-            self.hamer_tracker.stop()
-            self.hamer_tracker = None
         if self.quest_receiver is not None:
+            self.stop_quest_hand_follower()
             self.quest_receiver.stop()
             self.quest_receiver = None
         self.renderer.close()
@@ -5487,17 +4879,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--robot-ip", default="192.168.5.11")
     parser.add_argument("--model", type=Path, default=core.DEFAULT_MODEL)
     parser.add_argument("--output-dir", type=Path, default=core.DEFAULT_OUTPUT_DIR)
-    parser.add_argument(
-        "--hamer-bridge-url",
-        default="http://128.200.5.196:8765",
-        help="HaMeR HTTP bridge base URL; /infer is appended automatically.",
-    )
-    parser.add_argument(
-        "--hamer-video",
-        default=str(DEFAULT_HAMER_ORIGIN_VIDEO),
-        help="Dedicated HaMeR origin-definition video path.",
-    )
-    parser.add_argument("--hamer-camera-id", type=int, default=1)
     parser.add_argument(
         "--quest-protocol",
         choices=("udp", "tcp"),

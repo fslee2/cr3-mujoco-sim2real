@@ -366,19 +366,38 @@ GUI 的 `Meta Quest 仿真` 直接复用 `hand-tracking-streamer` 原仓库
 2. 在 `Quest 设置…` 中选 UDP/TCP、监听端口和左/右手；
 3. UDP 时在 Quest 内填这台电脑的局域网 IP，GUI 默认监听 `0.0.0.0:9000`；
 4. 点击 `启动 Quest 接收`，等状态栏出现腕部 XYZ；
-5. 点击 `仿真 Home` 或启动实机接管，让 Quest 回到水平工具 Home；
+5. 点击 `仿真 Home` 或启动实机接管，让 Quest 回到与所选映射模式匹配的 Home；
 6. 将手放在舒适的中性位，按 `R` 或点击 `设定腕部原点`；
-7. 之后腕部位移通过 `Quest → 坐标转换 → MuJoCo IK` 控制 Link6 的 XYZ，末端姿态固定为
-   `RX=+92.43°、RY=+0.59°、RZ=+88.17°`，TCP Z轴约平行世界 `+X`。
+7. 之后腕部位移通过 `Quest → 坐标转换 → MuJoCo IK` 控制 Link6 的 XYZ，末端姿态锁定为
+   该 Home 姿态：`反向末端 XYZ` 为水平工具姿态（TCP Z 轴约平行世界 `+X`），
+   `原本·基座 XYZ` 为通用 Home 姿态。
 
-Quest 面板的 `到 Quest Home` 按钮可随时将 MuJoCo 回到该姿态；如果 Quest 实机同步
-已经处于 ACTIVE，则按钮也会发送该目标，否则实体 CR3 需要通过受保护的
-`Quest 实机同步` 流程回 Home。
+Quest 面板的 `到 Quest Home` 按钮可随时将 MuJoCo 回到与当前映射模式匹配的 Home；
+如果 Quest 实机同步已经处于 ACTIVE，则按钮也会发送该目标，否则实体 CR3 需要通过
+受保护的 `Quest 实机同步` 流程回 Home。
 
 原始 Unity 坐标按 `(x右, y上, z前) → (x前, y左, z上)` 转换。当前版本只将
 腕部 XYZ 映射到 MuJoCo；四元数和 21 个手部关键点已接收并显示状态，
-但不用于驱动末端旋转。Quest 实机接管使用截图校准的独立水平工具 Home，
-不会改变普通键盘/回放模式的通用 Home。
+但不用于驱动末端旋转。Quest 实机接管使用与所选映射模式匹配的 Home
+（`反向末端 XYZ` 为截图校准的水平工具 Home），不会改变普通键盘/回放模式的通用 Home。
+
+Quest 面板现在提供两种独立的 CR3 XYZ 版本，每个版本各自对应一个 Home：
+
+- `原本·基座 XYZ`：保持历史映射 `(x右,y上,z前) → (x前,y左,z上)`；对应通用
+  Home（J1≈0°，末端正前方），方向锁定姿态为该 Home 的 Link6 姿态。
+- `反向末端 XYZ`：保留前后方向，将横向和竖直方向相对原映射翻转；对应截图校准
+  的水平工具 Home（J1≈180°，末端绕工具轴翻转约 180°）。
+
+两种映射共用滤波、IK 和实机限速，但 `仿真 Home` / `到 Quest Home` / Quest 实机
+接管都会回到与当前模式匹配的 Home。建议停止 Quest 接收后切换版本，再重新按
+`R` 设定腕部原点。
+
+如果同时需要控制 CRAFT 灵巧手，先启动 Quest 接收，再点击 `启动 Quest 手部跟随`。
+GUI 继续独占 Quest 的 `UDP 9000`，将原始 21 点数据转发到本机 `UDP 9001`，并启动
+`CRAFT-Hand_API\python\streamer_thumb_opposition_follow.py`：因此 CR3 腕部 XYZ
+控制和 CRAFT 手指/拇指对指控制可以并行。默认只做手部数据预览；勾选
+`CRAFT 灵巧手实机输出（谨慎）` 后才会给该脚本附加 `--live`，只对 CRAFT 手生效，
+不会自动改变 CR3 的实机同步状态。若不启动 Quest 接收，手部跟随按钮不会启动。
 
 Quest 响应链已针对跟手性调整：GUI 以 60 Hz 调度最新腕部帧，wrist 与 landmarks
 使用独立序号，因此 landmarks 不会重复驱动旧腕部位置。滤波根据腕部速度在慢速

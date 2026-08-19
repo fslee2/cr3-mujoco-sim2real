@@ -50,6 +50,8 @@ from cr3_sim2real.hamer_real import (
 )
 from cr3_sim2real.joint_mapping import real_deg_to_sim_rad, sim_rad_to_real_deg
 from cr3_sim2real.quest_hand import (
+    QUEST_MOTION_MODE_ORIGINAL,
+    QUEST_MOTION_MODE_REVERSED_END,
     QuestHandReceiver,
     QuestWristMapper,
     parse_quest_line,
@@ -117,6 +119,19 @@ class KeyboardSim2RealTests(unittest.TestCase):
         target = mapper.target_pos([1.1, 2.2, 3.3])
         # Unity (right, up, forward) -> robot (forward, left, up).
         np.testing.assert_allclose(target, [0.7, 0.4, 0.8])
+
+    def test_quest_wrist_mapper_supports_reversed_end_mapping(self):
+        mapper = QuestWristMapper(
+            gain=1.0,
+            max_delta_m=1.0,
+            deadzone_m=0.0,
+            ema_alpha=1.0,
+            motion_mode=QUEST_MOTION_MODE_REVERSED_END,
+        )
+        mapper.calibrate([1.0, 2.0, 3.0], [0.4, 0.5, 0.6])
+        target = mapper.target_pos([1.1, 2.2, 3.3])
+        # The flipped tool frame keeps robot X and reverses robot Y/Z.
+        np.testing.assert_allclose(target, [0.7, 0.6, 0.4])
 
     def test_quest_adaptive_filter_reacts_faster_to_fast_motion(self):
         mapper = QuestWristMapper(
@@ -186,6 +201,16 @@ class KeyboardSim2RealTests(unittest.TestCase):
             and np.all(app.QUEST_HOME_Q_RAD <= limits[:, 1])
         )
 
+    def test_quest_home_q_rad_for_mode_matches_selected_mode(self):
+        np.testing.assert_allclose(
+            app.quest_home_q_rad_for_mode(QUEST_MOTION_MODE_ORIGINAL),
+            app.HOME_Q_RAD,
+        )
+        np.testing.assert_allclose(
+            app.quest_home_q_rad_for_mode(QUEST_MOTION_MODE_REVERSED_END),
+            app.QUEST_HOME_Q_RAD,
+        )
+
     def test_cartesian_tracking_limit_uses_speed_and_caps_stale_dt(self):
         limited = gui.limit_cartesian_tracking_step(
             [0.10, 0.0, 0.0], max_speed_m_s=0.8, dt=0.02
@@ -205,7 +230,7 @@ class KeyboardSim2RealTests(unittest.TestCase):
         controller.quest_last_valid_wrist_at = 1.0
         controller.stop_quest_real_sync = Mock()
         controller._check_quest_real_sync(
-            1.0 + gui.HAMER_REAL_HAND_WATCHDOG_S + 0.01
+            1.0 + gui.QUEST_REAL_HAND_WATCHDOG_S + 0.01
         )
         controller.stop_quest_real_sync.assert_called_once()
         self.assertIn(
@@ -320,7 +345,6 @@ class KeyboardSim2RealTests(unittest.TestCase):
         controller.live_starting = False
         controller.teach_active = False
         controller.teach_starting = False
-        controller.hamer_real_stage = "idle"
         controller.quest_real_stage = "idle"
         controller.recorder = Mock(recording=False)
         controller.log = Mock()
@@ -340,24 +364,18 @@ class KeyboardSim2RealTests(unittest.TestCase):
         )
 
     def test_english_runtime_log_translation_preserves_dynamic_values(self):
-        translated = gui.translate_runtime_log(
-            "HaMeR 实机同步最终检查失败：当前没有有效手部 cam_t"
-        )
-        self.assertEqual(
-            translated,
-            "HaMeR Robot Sync final check failed: no valid hand cam_t is available",
-        )
         self.assertEqual(
             gui.translate_runtime_log("平移步长 必须在 0.1 到 50 之间"),
             "translation step must be between 0.1 and 50",
         )
+        quest_translated = gui.translate_runtime_log(
+            "Quest UDP 正在监听 0.0.0.0:9000，控制手=right。"
+        )
         self.assertEqual(
-            gui.translate_runtime_log(
-                "Quest UDP 正在监听 0.0.0.0:9000，控制手=right。"
-            ),
+            quest_translated,
             "Quest UDP listening on 0.0.0.0:9000, control hand=right.",
         )
-        self.assertFalse(any("\u3400" <= char <= "\u9fff" for char in translated))
+        self.assertFalse(any("\u3400" <= char <= "\u9fff" for char in quest_translated))
         self.assertEqual(gui.UI_TEXT_EN["清空日志"], "Clear Log")
         self.assertEqual(gui.UI_TEXT_EN["实机回 Home"], "Robot Home")
 
@@ -390,8 +408,6 @@ class KeyboardSim2RealTests(unittest.TestCase):
         controller.armed_until = 10.0
         controller.arm_status_var = Mock()
         controller.live_starting = True
-        controller.hamer_real_stage = "active"
-        controller.hamer_real_confirm_until = 10.0
         controller.quest_real_stage = "active"
         controller.quest_real_confirm_until = 10.0
         controller.teach_active = True
@@ -417,7 +433,6 @@ class KeyboardSim2RealTests(unittest.TestCase):
         controller.real_stop_event.set.assert_called_once_with()
         controller._clear_motion_keys.assert_called_once_with()
         self.assertIsNone(controller.live_hardware)
-        self.assertEqual(controller.hamer_real_stage, "idle")
         self.assertEqual(controller.quest_real_stage, "idle")
         self.assertFalse(controller.teach_active)
         self.assertFalse(controller.disable_in_progress)
@@ -430,7 +445,6 @@ class KeyboardSim2RealTests(unittest.TestCase):
         controller._set_button_text = Mock()
         home_ee = np.array([0.1, 0.2, 0.3])
         controller._set_sim_home_now = Mock(return_value=home_ee)
-        controller.hamer_mapper = Mock(calibrated=True)
         controller.quest_mapper = Mock(calibrated=True)
         controller._update_feedback_display = Mock()
         controller.status_var = Mock()
@@ -441,7 +455,6 @@ class KeyboardSim2RealTests(unittest.TestCase):
 
         self.assertFalse(controller.real_busy)
         self.assertFalse(controller.manual_home_active)
-        controller.hamer_mapper.reanchor_robot_origin.assert_called_once_with(home_ee)
         controller.quest_mapper.reanchor_robot_origin.assert_called_once_with(home_ee)
         controller._update_feedback_display.assert_called_once_with(state)
 
@@ -1303,6 +1316,16 @@ class KeyboardSim2RealTests(unittest.TestCase):
         self.assertGreater(np.linalg.norm(result - app.HOME_Q_RAD), 0.0)
         self.assertTrue(np.all(result >= model.jnt_range[joint_ids, 0]))
         self.assertTrue(np.all(result <= model.jnt_range[joint_ids, 1]))
+
+    def test_default_model_has_quest_mocap_marker(self):
+        model = mujoco.MjModel.from_xml_path(str(app.DEFAULT_MODEL))
+        body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "quest_wrist_marker")
+        self.assertGreaterEqual(body_id, 0)
+        self.assertGreaterEqual(model.nmocap, 1)
+        self.assertEqual(model.body_mocapid[body_id], 0)
+        geoms = np.flatnonzero(model.geom_bodyid == body_id)
+        self.assertEqual(geoms.size, 1)
+        self.assertGreater(model.geom_rgba[geoms[0], 3], 0.0)
 
     def test_record_save_validate_and_dry_run(self):
         recorder = TrajectoryRecorder(sample_period=0.02)

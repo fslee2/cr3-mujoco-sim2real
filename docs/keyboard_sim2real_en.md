@@ -147,13 +147,44 @@ documented UTF-8 CSV messages. No HaMeR bridge or APK change is required.
 
 Select the mode, open `Quest Settings`, choose UDP/TCP, port, and controlling
 hand, then start the receiver. For UDP, enter this PC's LAN address in the
-headset while the GUI normally listens on `0.0.0.0:9000`. When live wrist XYZ
-appears, hold a neutral pose and press `R` to establish the explicit origin.
+headset while the GUI normally listens on `0.0.0.0:9000`. Bring the arm to the
+Home that matches the selected motion mapping (sim `Home [KP 5]`, or the
+guarded robot-sync flow), hold a comfortable neutral pose, and press `R` (or
+click `Set Wrist Origin`) to establish the explicit origin.
 
-Raw Unity axes are converted from `(x right, y up, z forward)` to the project
-frame `(x forward, y left, z up)`. This first integration maps wrist XYZ through
-MuJoCo IK only. Wrist quaternion and 21 landmarks are received for telemetry,
-but do not yet command end-effector rotation.
+The Quest panel provides two independent CR3 XYZ mappings, each paired with its
+own Home and orientation lock:
+
+- `Original · base XYZ`: keeps the historical mapping
+  `(x right, y up, z forward) → (x forward, y left, z up)`, paired with the
+  generic Home (J1≈0°, tool faces forward).
+- `Reversed tool XYZ`: preserves forward/back motion and flips the transverse
+  and vertical axes relative to the original, paired with the screenshot-
+  calibrated horizontal-tool Home (J1≈180°, tool rolled about 180° around its
+  longitudinal axis).
+
+Both mappings share the same filtering, IK, and host-side speed limiting, but
+sim `Home`, `Go Quest Home`, and the guarded Quest robot sync all return to the
+Home that matches the current mapping. The tool orientation is locked to that
+Home's Link6 pose; wrist XYZ is the only live input, while the wrist quaternion
+and 21 landmarks are received for telemetry and do not command end-effector
+rotation. Stop the Quest receiver before switching mappings, then press `R`
+again to re-establish the wrist origin.
+
+`Go Quest Home` returns MuJoCo to the mode-matching Home at any time. When the
+guarded Quest robot sync is already ACTIVE, the button also sends that target
+to the physical CR3; otherwise the real robot returns Home only through the
+protected `Quest Robot Sync` flow.
+
+To control a CRAFT dexterous hand at the same time, start the Quest receiver
+and then click `Start Quest hand follower`. The GUI keeps exclusive use of
+UDP `9000`, relays the raw 21-point stream to localhost UDP `9001`, and starts
+`CRAFT-Hand_API\python\streamer_thumb_opposition_follow.py`, so CR3 wrist XYZ
+and CRAFT finger/thumb opposition run in parallel. The follower previews hand
+data only by default; checking `CRAFT hand hardware output (caution)` appends
+`--live` for that script. It affects only the CRAFT hand and never changes the
+CR3 robot-sync state. The follower buttons do nothing unless the Quest
+receiver is running.
 
 The responsive path schedules the newest wrist sample at 60 Hz and tracks wrist
 and landmark sequences separately, so a landmark packet cannot reapply an old

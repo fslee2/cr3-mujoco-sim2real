@@ -17,6 +17,7 @@ HaMeR 手部位置映射。实体操作默认锁定，必须显式传入
 
 - [中文使用与安全说明](docs/keyboard_sim2real.md)
 - [English guide](docs/keyboard_sim2real_en.md)
+- [项目交接文档](PROJECT_HANDOFF.md)
 - 依赖安装：`python -m pip install -r requirements-sim2real.txt`
 
 

@@ -29,6 +29,21 @@ R_UNITY_TO_ROBOT = np.array(
     dtype=float,
 )
 
+# The original mapping is expressed in the fixed CR3/MuJoCo base frame.  The
+# preferred Quest Home pose is rolled by 180 degrees around the tool's
+# longitudinal axis; in that pose a user can also choose to interpret hand
+# motion in the flipped tool frame.  This preserves forward/backward motion
+# while reversing the two transverse axes.
+R_UNITY_TO_ROBOT_REVERSED_END = (
+    np.diag([1.0, -1.0, -1.0]) @ R_UNITY_TO_ROBOT
+)
+QUEST_MOTION_MODE_ORIGINAL = "original"
+QUEST_MOTION_MODE_REVERSED_END = "reversed_end"
+QUEST_MOTION_MODES = (
+    QUEST_MOTION_MODE_ORIGINAL,
+    QUEST_MOTION_MODE_REVERSED_END,
+)
+
 
 def quest_quaternion_to_robot_rotation(quaternion: np.ndarray) -> np.ndarray:
     """Convert a Quest/Unity ``(x, y, z, w)`` quaternion to robot axes.
@@ -143,7 +158,13 @@ def parse_quest_line(line: str) -> QuestPacket | None:
 class QuestHandReceiver:
     """Background UDP/TCP listener for Hand Tracking Streamer telemetry."""
 
-    def __init__(self, protocol: str = "udp", host: str = "0.0.0.0", port: int = 9000):
+    def __init__(
+        self,
+        protocol: str = "udp",
+        host: str = "0.0.0.0",
+        port: int = 9000,
+        relay: tuple[str, int] | None = None,
+    ):
         protocol = protocol.lower().strip()
         if protocol not in {"udp", "tcp"}:
             raise ValueError("Quest protocol must be udp or tcp")
@@ -157,6 +178,8 @@ class QuestHandReceiver:
         self._socket: socket.socket | None = None
         self._thread: threading.Thread | None = None
         self._clients: set[socket.socket] = set()
+        self._relay = relay
+        self._relay_socket: socket.socket | None = None
         self._sequence = 0
         self._packets_received = 0
         self._state = {
@@ -165,6 +188,28 @@ class QuestHandReceiver:
             "head": self._empty_state(),
         }
         self.status = "not started"
+
+    def set_relay(self, relay: tuple[str, int] | None) -> None:
+        """Forward each received text datagram to a local consumer.
+
+        This lets the GUI own the Quest UDP port while a companion hand
+        follower receives the exact same stream on a separate localhost port.
+        The relay is best-effort and never blocks or affects CR3 control.
+        """
+        self._relay = relay
+
+    def _relay_text(self, text: str) -> None:
+        relay = self._relay
+        if relay is None:
+            return
+        try:
+            if self._relay_socket is None:
+                self._relay_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self._relay_socket.sendto(text.encode("utf-8"), relay)
+        except OSError:
+            # The companion process may be stopped or restarting.  Its
+            # absence must not interrupt the arm receiver.
+            pass
 
     @staticmethod
     def _empty_state() -> dict:
@@ -213,6 +258,13 @@ class QuestHandReceiver:
                 listener.close()
             except OSError:
                 pass
+        relay_socket = self._relay_socket
+        self._relay_socket = None
+        if relay_socket is not None:
+            try:
+                relay_socket.close()
+            except OSError:
+                pass
         with self._lock:
             clients = list(self._clients)
             self._clients.clear()
@@ -257,6 +309,7 @@ class QuestHandReceiver:
             )
 
     def _accept_text(self, text: str, sender: str) -> None:
+        self._relay_text(text)
         for line in text.splitlines():
             packet = parse_quest_line(line.strip())
             if packet is None:
@@ -359,6 +412,7 @@ class QuestWristMapper:
         slow_speed_m_s: float = 0.02,
         fast_speed_m_s: float = 0.20,
         filter_reference_hz: float = 60.0,
+        motion_mode: str = QUEST_MOTION_MODE_ORIGINAL,
     ) -> None:
         self.gain = float(gain)
         self.max_delta_m = float(max_delta_m)
@@ -372,6 +426,11 @@ class QuestWristMapper:
         self.slow_speed_m_s = float(slow_speed_m_s)
         self.fast_speed_m_s = float(fast_speed_m_s)
         self.filter_reference_hz = float(filter_reference_hz)
+        self.motion_mode = str(motion_mode).strip().lower()
+        if self.motion_mode not in QUEST_MOTION_MODES:
+            raise ValueError(
+                "Quest motion mode must be 'original' or 'reversed_end'"
+            )
         if not 0.0 < self.ema_alpha <= self.fast_ema_alpha <= 1.0:
             raise ValueError("Quest filter alpha must satisfy 0 < slow <= fast <= 1")
         if not 0.0 <= self.slow_speed_m_s < self.fast_speed_m_s:
@@ -390,6 +449,22 @@ class QuestWristMapper:
     @property
     def calibrated(self) -> bool:
         return self.wrist_origin is not None and self.ee_origin is not None
+
+    @property
+    def axis_map(self) -> np.ndarray:
+        """Return the selected Unity-to-CR3 Cartesian axis map."""
+        if self.motion_mode == QUEST_MOTION_MODE_REVERSED_END:
+            return R_UNITY_TO_ROBOT_REVERSED_END
+        return R_UNITY_TO_ROBOT
+
+    def set_motion_mode(self, motion_mode: str) -> None:
+        """Switch between the original base-frame and flipped-tool mappings."""
+        mode = str(motion_mode).strip().lower()
+        if mode not in QUEST_MOTION_MODES:
+            raise ValueError(
+                "Quest motion mode must be 'original' or 'reversed_end'"
+            )
+        self.motion_mode = mode
 
     def clear_origin(self) -> None:
         self.wrist_origin = None
@@ -443,7 +518,7 @@ class QuestWristMapper:
         assert self.wrist_origin is not None and self.ee_origin is not None
         wrist = np.asarray(wrist_position, dtype=float).reshape(3)
         relative = wrist - self.wrist_origin
-        robot_delta = self.gain * (R_UNITY_TO_ROBOT @ relative)
+        robot_delta = self.gain * (self.axis_map @ relative)
         robot_delta[np.abs(robot_delta) < self.deadzone_m] = 0.0
         robot_delta = np.clip(robot_delta, -self.max_delta_m, self.max_delta_m)
         raw_target = self.ee_origin + robot_delta
