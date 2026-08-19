@@ -169,10 +169,21 @@ class KeyboardSim2RealTests(unittest.TestCase):
 
     def test_quest_home_pose_locks_tool_z_to_world_x(self):
         # The third rotation column is the tool/TCP Z axis in the world frame.
+        tool_z = app.QUEST_HOME_ROTATION[:, 2]
+        self.assertLess(float(np.linalg.norm(tool_z - [1.0, 0.0, 0.0])), 0.06)
         np.testing.assert_allclose(
-            app.QUEST_HOME_ROTATION[:, 2],
-            [1.0, 0.0, 0.0],
+            app.QUEST_HOME_ROTATION.T @ app.QUEST_HOME_ROTATION,
+            np.eye(3),
             atol=1e-12,
+        )
+
+    def test_quest_home_joints_are_inside_model_limits(self):
+        model = mujoco.MjModel.from_xml_path(str(app.DEFAULT_MODEL))
+        joint_ids, _, _ = app.joint_indices(model)
+        limits = model.jnt_range[joint_ids]
+        self.assertTrue(
+            np.all(app.QUEST_HOME_Q_RAD >= limits[:, 0])
+            and np.all(app.QUEST_HOME_Q_RAD <= limits[:, 1])
         )
 
     def test_cartesian_tracking_limit_uses_speed_and_caps_stale_dt(self):

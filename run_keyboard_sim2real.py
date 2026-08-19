@@ -50,9 +50,9 @@ HOME_Q_RAD = np.array([0.0, 0.6072, -1.7223, -0.2949, 1.6134, 0.0])
 # This is intentionally separate from the project's generic Home used by
 # playback and ordinary keyboard/live-sync modes.
 QUEST_HOME_Q_RAD = np.deg2rad(
-    [0.0, 34.79, -98.63, 63.62, 92.45, 0.0]
+    [182.16, -20.71, 113.30, 89.92, 94.18, 0.10]
 )
-QUEST_HOME_EULER_DEG = np.array([-90.0, 0.0, -90.0], dtype=float)
+QUEST_HOME_EULER_DEG = np.array([92.43, 0.59, 88.17], dtype=float)
 
 
 def _rotation_x(angle_rad: float) -> np.ndarray:

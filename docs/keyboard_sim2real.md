@@ -369,7 +369,11 @@ GUI 的 `Meta Quest 仿真` 直接复用 `hand-tracking-streamer` 原仓库
 5. 点击 `仿真 Home` 或启动实机接管，让 Quest 回到水平工具 Home；
 6. 将手放在舒适的中性位，按 `R` 或点击 `设定腕部原点`；
 7. 之后腕部位移通过 `Quest → 坐标转换 → MuJoCo IK` 控制 Link6 的 XYZ，末端姿态固定为
-   `RX=-90°、RY=0°、RZ=-90°`，TCP Z轴约平行世界 `+X`。
+   `RX=+92.43°、RY=+0.59°、RZ=+88.17°`，TCP Z轴约平行世界 `+X`。
+
+Quest 面板的 `到 Quest Home` 按钮可随时将 MuJoCo 回到该姿态；如果 Quest 实机同步
+已经处于 ACTIVE，则按钮也会发送该目标，否则实体 CR3 需要通过受保护的
+`Quest 实机同步` 流程回 Home。
 
 原始 Unity 坐标按 `(x右, y上, z前) → (x前, y左, z上)` 转换。当前版本只将
 腕部 XYZ 映射到 MuJoCo；四元数和 21 个手部关键点已接收并显示状态，

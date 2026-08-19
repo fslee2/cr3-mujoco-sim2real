@@ -930,6 +930,14 @@ class CR3ControlGUI:
         )
         if self.end_effector_id < 0:
             raise ValueError("MuJoCo end-effector body Link6 was not found")
+        quest_home = core.QUEST_HOME_Q_RAD
+        quest_limits = self.model.jnt_range[self.arm_joint_ids]
+        if np.any(quest_home < quest_limits[:, 0]) or np.any(
+            quest_home > quest_limits[:, 1]
+        ):
+            raise ValueError(
+                "Quest Home is outside the MuJoCo joint limits; refusing to start"
+            )
 
         self.q_target = core.HOME_Q_RAD.copy()
         self.data.qpos[self.arm_qpos_indices] = self.q_target
@@ -1547,8 +1555,8 @@ class CR3ControlGUI:
         ttk.Checkbutton(
             quest_mode,
             text=self._tr(
-                "锁定末端姿态（RX=-90°  RY=0°  RZ=-90°）",
-                "Lock tool pose (RX=-90°  RY=0°  RZ=-90°)",
+                "锁定末端姿态（RX=+92.43°  RY=+0.59°  RZ=+88.17°）",
+                "Lock tool pose (RX=+92.43°  RY=+0.59°  RZ=+88.17°)",
             ),
             variable=self.quest_orientation_mode_var,
             command=self._on_quest_orientation_toggle,
@@ -1575,6 +1583,18 @@ class CR3ControlGUI:
         )
         self.quest_real_button.grid(
             row=4,
+            column=0,
+            columnspan=2,
+            sticky="ew",
+            pady=(5, 0),
+        )
+        self.quest_home_button = ttk.Button(
+            quest_mode,
+            text="到 Quest Home",
+            command=self.go_quest_home,
+        )
+        self.quest_home_button.grid(
+            row=5,
             column=0,
             columnspan=2,
             sticky="ew",
@@ -3268,6 +3288,31 @@ class CR3ControlGUI:
         mujoco.mj_forward(self.model, self.data)
         return self.data.xpos[self.end_effector_id].copy()
 
+    def go_quest_home(self) -> None:
+        """Move the simulation, or an already active Quest stream, to Quest Home."""
+        if self.estop_latched:
+            self.log("软件急停已锁存，不能移动到 Quest Home。")
+            return
+        if self.quest_real_stage in ("homing", "ready", "connecting"):
+            self.q_target = core.QUEST_HOME_Q_RAD.copy()
+            self.log("Quest 实机接管流程正在回 Quest Home。")
+            return
+        if self.quest_real_stage == "active" and self.live_hardware is not None:
+            self.q_target = core.QUEST_HOME_Q_RAD.copy()
+            self.log("Quest 实机同步活动中，正在发送 Quest Home 目标。")
+            return
+        if self.real_busy or self.live_hardware is not None or self.teach_active:
+            self.log("当前存在其他实机运动流程，不能移动到 Quest Home。")
+            return
+        home_ee = self._set_quest_home_now()
+        self.status_var.set("QUEST HOME")
+        self.quest_status_var.set("Quest Home · 固定姿态 · 等待腕部原点")
+        self.log(
+            "MuJoCo 已到 Quest Home；"
+            f"Link6={np.round(home_ee, 4).tolist()}。"
+            "实体 CR3 请通过“Quest 实机同步”流程回到同一姿态。"
+        )
+
     def prepare_hamer_real_home(self) -> None:
         """First confirmation: align, then move real and simulation to Home."""
         if not self.args.enable_real_execution:
@@ -4035,7 +4080,7 @@ class CR3ControlGUI:
             return
         self.log(
             "Quest 固定末端姿态已开启："
-            "RX=-90°、RY=0°、RZ=-90°；Quest 只控制 XYZ。"
+            "RX=+92.43°、RY=+0.59°、RZ=+88.17°；Quest 只控制 XYZ。"
         )
 
     def toggle_quest(self) -> None:
@@ -4091,6 +4136,7 @@ class CR3ControlGUI:
             return
         self.quest_mapper = mapper
         self.quest_receiver = receiver
+        self._set_quest_home_now()
         self.quest_phase = "wait_origin"
         self.quest_last_sequence = 0
         self.quest_last_wrist_received_at = 0.0
@@ -4104,7 +4150,8 @@ class CR3ControlGUI:
             f"Quest {receiver.protocol.upper()} 正在监听 "
             f"{receiver.host}:{receiver.port}，控制手={self.quest_hand_var.get()}。"
         )
-        self.log("Quest 实时接收已启动；按 R 前只显示腕部数据，不移动 MuJoCo。")
+        self.log("Quest 仿真已先到水平工具 Home；按 R 后开始 XYZ 控制。")
+        self.log("Quest 实时接收已启动；按 R 前只显示腕部数据，不跟随腕部移动。")
 
     def stop_quest(self, *, clear_origin: bool = True) -> None:
         self.stop_quest_real_sync()

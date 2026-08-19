@@ -64,7 +64,7 @@ Quest UDP wrist XYZ
 ```
 
 Quest的Quaternion目前不参与末端旋转控制。Quest模式进入接管前会回到独立的水平工具Home，
-固定目标姿态为`RX=-90°、RY=0°、RZ=-90°`，使TCP Z轴近似平行世界`+X`；Quest只改变XYZ。
+固定目标姿态为`RX=+92.43°、RY=+0.59°、RZ=+88.17°`，使TCP Z轴近似平行世界`+X`；Quest只改变XYZ。
 原有的通用Home仍用于键盘、回放和普通实时同步。
 
 ### 3.3 反馈链路
