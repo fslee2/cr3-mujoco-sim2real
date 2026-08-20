@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import argparse
 import ipaddress
+import importlib
 import json
 import math
 from pathlib import Path
 import queue
 import subprocess
+import sys
 import threading
 import time
 import tkinter as tk
@@ -75,6 +77,9 @@ QUEST_MAX_CONTROL_DT_S = 0.05
 QUEST_HAND_RELAY_PORT = 9001
 CRAFT_HAND_REPO = core.ROOT.parent.parent / "CRAFT-Hand_API"
 CRAFT_HAND_SCRIPT = CRAFT_HAND_REPO / "python" / "streamer_thumb_opposition_follow.py"
+CRAFT_MEDIAPIPE_SCRIPT = (
+    CRAFT_HAND_REPO / "python" / "mediapipe_thumb_opposition_follow.py"
+)
 CRAFT_HAND_PYTHON = CRAFT_HAND_REPO / ".venv" / "Scripts" / "python.exe"
 QUEST_REAL_HOME_SPEED_DEG_S = 5.0
 MANUAL_REAL_HOME_SPEED_DEG_S = 5.0
@@ -142,6 +147,39 @@ UI_TEXT_EN = {
     "等待手部原点…": "Waiting for Hand Origin…",
     "Meta Quest 仿真": "Meta Quest",
     "Quest 设置…": "Quest Settings…",
+    "MediaPipe 拇指控制…": "MediaPipe Thumb Control…",
+    "MediaPipe 拇指控制": "MediaPipe Thumb Control",
+    "启动 MediaPipe": "Start MediaPipe",
+    "停止 MediaPipe": "Stop MediaPipe",
+    "摄像头编号": "Camera index",
+    "电机串口（预览可留空）": "Motor port (optional in preview)",
+    "波特率（可留空）": "Baud rate (optional)",
+    "实机输出（谨慎）": "Live hardware output (caution)",
+    "电机电流 (mA)": "Motor current (mA)",
+    "控制频率 (Hz)": "Control rate (Hz)",
+    "最大拇指对掌幅度": "Max thumb opposition",
+    "接触距离": "Touch distance",
+    "张开距离": "Open distance",
+    "目标切换裕量": "Target switch margin",
+    "拇指滤波": "Thumb smoothing",
+    "整体滤波": "Overall smoothing",
+    "最大闭合比例": "Max close",
+    "启动后会打开独立的摄像头窗口；默认只预览，不驱动灵巧手。":
+        "Start runs inside the collapsible panel; preview is default and does not drive the hand.",
+    "MediaPipe 进程运行中": "MediaPipe process running",
+    "MediaPipe 未启动": "MediaPipe inactive",
+    "MediaPipe 预览已启动": "MediaPipe preview started",
+    "MediaPipe 实机输出已启动": "MediaPipe live hardware output started",
+    "MediaPipe 已停止": "MediaPipe stopped",
+    "锁定目标": "Lock target",
+    "恢复跟随": "Resume follow",
+    "保存位置 1": "Save position 1",
+    "保存位置 2": "Save position 2",
+    "调用位置 1": "Use position 1",
+    "调用位置 2": "Use position 2",
+    "灵巧手实机输出（谨慎）": "Live hand output (caution)",
+    "摄像头预览未启动": "Camera preview inactive",
+    "收起 MediaPipe 子页面": "Close MediaPipe panel",
     "启动 Quest 接收": "Start Quest Receiver",
     "停止 Quest 接收": "Stop Quest Receiver",
     "设定腕部原点  [R]": "Set Wrist Origin  [R]",
@@ -952,6 +990,21 @@ class CR3ControlGUI:
         self.quest_hand_process: subprocess.Popen[str] | None = None
         self.quest_hand_output_thread: threading.Thread | None = None
         self.quest_hand_relay_enabled = False
+        # MediaPipe is embedded in the main window.  The worker owns the
+        # camera/vision loop while Tk only paints the latest frame and sends
+        # lock/save commands, so no second OpenCV window is created.
+        self.mediapipe_thread: threading.Thread | None = None
+        self.mediapipe_stop_event = threading.Event()
+        self.mediapipe_command_queue: queue.Queue[str] = queue.Queue()
+        self.mediapipe_frame_lock = threading.Lock()
+        self.mediapipe_latest_frame: np.ndarray | None = None
+        self.mediapipe_photo: ImageTk.PhotoImage | None = None
+        self.mediapipe_panel: ttk.LabelFrame | None = None
+        self.mediapipe_preview: tk.Label | None = None
+        self.mediapipe_start_button: ttk.Button | None = None
+        self.mediapipe_lock_button: ttk.Button | None = None
+        self.mediapipe_position_buttons: dict[str, ttk.Button] = {}
+        self.mediapipe_panel_vars: dict[str, tk.Variable] = {}
         self.quest_phase = "idle"
         self.quest_last_sequence = 0
         self.quest_last_wrist_received_at = 0.0
@@ -1029,6 +1082,7 @@ class CR3ControlGUI:
             value=f"{QUEST_REAL_HOME_SPEED_DEG_S:g}"
         )
         self.quest_status_var = tk.StringVar(value="Quest 未启动 · 仅控制 MuJoCo")
+        self.mediapipe_status_var = tk.StringVar(value="MediaPipe 未启动")
         self.last_applied_live_speed: float | None = None
 
         self._build_ui()
@@ -1143,6 +1197,21 @@ class CR3ControlGUI:
             padding=5,
         )
         style.configure(
+            "Trajectory.TCombobox",
+            fieldbackground="#13243a",
+            background="#1b2a41",
+            foreground="#f2f7ff",
+            arrowcolor="#b9d7ff",
+            arrowsize=18,
+            padding=(12, 8),
+            font=("Microsoft YaHei UI", 12),
+        )
+        style.map(
+            "Trajectory.TCombobox",
+            fieldbackground=[("readonly", "#13243a"), ("focus", "#183453")],
+            foreground=[("readonly", "#f2f7ff")],
+        )
+        style.configure(
             "TSpinbox",
             fieldbackground="#0d1726",
             foreground="#f2f7ff",
@@ -1204,6 +1273,12 @@ class CR3ControlGUI:
         ttk.Label(top, textvariable=self.robot_status_var, style="Status.TLabel").pack(
             side=tk.RIGHT
         )
+        self.mediapipe_button = ttk.Button(
+            top,
+            text=self._tr("MediaPipe 拇指控制…", "MediaPipe Thumb Control…"),
+            command=self.open_mediapipe_thumb_panel,
+        )
+        self.mediapipe_button.pack(side=tk.RIGHT, padx=(10, 0))
 
         body = ttk.Frame(self.root, padding=(10, 0, 10, 10))
         body.pack(fill=tk.BOTH, expand=True)
@@ -1658,7 +1733,8 @@ class CR3ControlGUI:
         trajectory = ttk.LabelFrame(controls, text="仿真与轨迹", padding=10, style="Card.TLabelframe")
         trajectory.grid(row=1, column=1, sticky="nsew", padx=(4, 0), pady=(0, 7))
         for column in range(2):
-            trajectory.columnconfigure(column, weight=1)
+            trajectory.columnconfigure(column, weight=1, uniform="trajectory")
+        trajectory.columnconfigure(1, minsize=230)
         self.record_button = ttk.Button(
             trajectory, text="开始记录  [KP Enter]", command=self.toggle_record
         )
@@ -1679,7 +1755,8 @@ class CR3ControlGUI:
             trajectory,
             state="readonly",
             textvariable=self.trajectory_combo_var,
-            width=22,
+            width=30,
+            style="Trajectory.TCombobox",
         )
         self.trajectory_combo.grid(
             row=2, column=1, sticky="ew", padx=(5, 0), pady=(5, 0)
@@ -1692,9 +1769,132 @@ class CR3ControlGUI:
             row=4, column=0, columnspan=2, sticky="w", pady=(5, 0)
         )
 
+        # Collapsible MediaPipe child page.  It stays inside the right-hand
+        # control column and therefore cannot cover the MuJoCo viewport or
+        # open a second camera window.
+        self.mediapipe_panel = ttk.LabelFrame(
+            controls,
+            text=self._tr("MediaPipe 拇指控制", "MediaPipe Thumb Control"),
+            padding=7,
+            style="Card.TLabelframe",
+        )
+        self.mediapipe_panel.grid(
+            row=2,
+            column=0,
+            columnspan=2,
+            sticky="nsew",
+            pady=(0, 7),
+        )
+        self.mediapipe_panel.columnconfigure(0, weight=1)
+        self.mediapipe_panel.columnconfigure(1, weight=1)
+        self.mediapipe_panel.rowconfigure(0, minsize=210)
+        self.mediapipe_panel_vars = {
+            "camera": tk.StringVar(value="1"),
+            "motor_port": tk.StringVar(value=""),
+            "baud": tk.StringVar(value=""),
+            "current_ma": tk.StringVar(value="350"),
+            "control_hz": tk.StringVar(value="20"),
+            "max_position_step_rad": tk.StringVar(value="0.05"),
+            "max_opposition": tk.StringVar(value="0.20"),
+            "touch_distance": tk.StringVar(value="0.12"),
+            "open_distance": tk.StringVar(value="0.70"),
+            "switch_margin": tk.StringVar(value="0.08"),
+            "thumb_smoothing": tk.StringVar(value="0.70"),
+            "smoothing": tk.StringVar(value="0.45"),
+            "max_close": tk.StringVar(value="0.30"),
+            "live": tk.BooleanVar(value=False),
+        }
+        preview_frame = tk.Frame(
+            self.mediapipe_panel,
+            bg="#07101c",
+            height=210,
+            highlightthickness=1,
+            highlightbackground="#365071",
+        )
+        preview_frame.grid(
+            row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6)
+        )
+        preview_frame.pack_propagate(False)
+        self.mediapipe_preview = tk.Label(
+            preview_frame,
+            text=self._tr("摄像头预览未启动", "Camera preview inactive"),
+            bg="#07101c",
+            fg="#8fbfff",
+            font=("Segoe UI", 12),
+            anchor="center",
+        )
+        self.mediapipe_preview.pack(fill=tk.BOTH, expand=True)
+        self.mediapipe_start_button = ttk.Button(
+            self.mediapipe_panel,
+            text=self._tr("启动 MediaPipe", "Start MediaPipe"),
+            command=self.toggle_mediapipe_thumb,
+        )
+        self.mediapipe_start_button.grid(row=1, column=0, sticky="ew", padx=(0, 4))
+        ttk.Checkbutton(
+            self.mediapipe_panel,
+            text=self._tr("灵巧手实机输出（谨慎）", "Live hand output (caution)"),
+            variable=self.mediapipe_panel_vars["live"],
+            style="Card.TCheckbutton",
+        ).grid(row=1, column=1, sticky="w", padx=(4, 0))
+
+        self.mediapipe_lock_button = ttk.Button(
+            self.mediapipe_panel,
+            text=self._tr("锁定目标", "Lock target"),
+            command=self.toggle_mediapipe_lock,
+        )
+        self.mediapipe_lock_button.grid(row=2, column=0, sticky="ew", padx=(0, 4), pady=(5, 0))
+        ttk.Button(
+            self.mediapipe_panel,
+            text=self._tr("恢复跟随", "Resume follow"),
+            command=lambda: self._queue_mediapipe_command("resume"),
+        ).grid(row=2, column=1, sticky="ew", padx=(4, 0), pady=(5, 0))
+
+        for col, slot in enumerate(("1", "2")):
+            ttk.Button(
+                self.mediapipe_panel,
+                text=self._tr(f"保存位置 {slot}", f"Save position {slot}"),
+                command=lambda s=slot: self._queue_mediapipe_command(f"save:{s}"),
+            ).grid(row=3, column=col, sticky="ew", padx=(0 if col == 0 else 4, 4 if col == 0 else 0), pady=(5, 0))
+            self.mediapipe_position_buttons[slot] = ttk.Button(
+                self.mediapipe_panel,
+                text=self._tr(f"调用位置 {slot}", f"Use position {slot}"),
+                command=lambda s=slot: self._queue_mediapipe_command(f"use:{s}"),
+            )
+            self.mediapipe_position_buttons[slot].grid(
+                row=4, column=col, sticky="ew", padx=(0 if col == 0 else 4, 4 if col == 0 else 0), pady=(5, 0)
+            )
+        ttk.Label(
+            self.mediapipe_panel,
+            textvariable=self.mediapipe_status_var,
+            style="Card.TLabel",
+            wraplength=480,
+        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Button(
+            self.mediapipe_panel,
+            text=self._tr("收起 MediaPipe 子页面", "Close MediaPipe panel"),
+            command=self.open_mediapipe_thumb_panel,
+        ).grid(row=6, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        # Keep advanced calibration values available without expanding the
+        # main page.  They are intentionally compact and editable in-place.
+        advanced = ttk.Frame(self.mediapipe_panel, style="Card.TFrame")
+        advanced.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        advanced.columnconfigure(1, weight=1)
+        ttk.Label(advanced, text=self._tr("摄像头编号", "Camera index"), style="Card.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Entry(advanced, textvariable=self.mediapipe_panel_vars["camera"], width=6).grid(row=0, column=1, sticky="e")
+        ttk.Label(advanced, text=self._tr("电机串口（预览可留空）", "Motor port (preview may be blank)"), style="Card.TLabel").grid(row=1, column=0, sticky="w")
+        ttk.Entry(advanced, textvariable=self.mediapipe_panel_vars["motor_port"], width=12).grid(row=1, column=1, sticky="e")
+        ttk.Label(advanced, text=self._tr("波特率", "Baud"), style="Card.TLabel").grid(row=2, column=0, sticky="w")
+        ttk.Entry(advanced, textvariable=self.mediapipe_panel_vars["baud"], width=12).grid(row=2, column=1, sticky="e")
+        # Calibration values remain available to the worker with safe
+        # defaults, but the child page stays compact and focused on the two
+        # requested operations: lock and save/use positions 1/2.
+        advanced.grid_remove()
+
+        self.mediapipe_panel.grid_remove()
+
         log_frame = ttk.LabelFrame(controls, text="运行日志", padding=7, style="Card.TLabelframe")
-        log_frame.grid(row=2, column=0, columnspan=2, sticky="nsew")
-        controls.rowconfigure(2, weight=1)
+        log_frame.grid(row=3, column=0, columnspan=2, sticky="nsew")
+        controls.rowconfigure(3, weight=1)
         log_toolbar = ttk.Frame(log_frame, style="Card.TFrame")
         log_toolbar.pack(fill=tk.X, pady=(0, 5))
         self.clear_log_button = ttk.Button(
@@ -1730,11 +1930,19 @@ class CR3ControlGUI:
         return UI_TEXT_EN.get(chinese, chinese)
 
     def _set_button_text(self, widget, chinese: str) -> None:
+        if widget is None:
+            return
         text = self._tr(chinese)
-        if isinstance(widget, RoundedButton):
-            widget.set_text(text)
-        else:
-            widget.configure(text=text)
+        try:
+            if isinstance(widget, RoundedButton):
+                widget.set_text(text)
+            else:
+                widget.configure(text=text)
+        except tk.TclError:
+            # A child panel may be closed while its worker is finishing.
+            # Button state is cosmetic at that point, so ignore stale-widget
+            # updates instead of surfacing another Tk callback exception.
+            return
 
     def _walk_widgets(self, parent):
         for child in parent.winfo_children():
@@ -1754,6 +1962,7 @@ class CR3ControlGUI:
         self.style.configure("TRadiobutton", font=(ui_font, 12))
         self.style.configure("TEntry", font=(ui_font, 12))
         self.style.configure("TCombobox", font=(ui_font, 12))
+        self.style.configure("Trajectory.TCombobox", font=(ui_font, 12))
         self.style.configure("TSpinbox", font=(ui_font, 12))
         self.log_text.configure(font=(ui_font, 11))
 
@@ -1783,6 +1992,7 @@ class CR3ControlGUI:
             self.live_speed_status_var,
             self.teach_status_var,
             self.quest_status_var,
+            self.mediapipe_status_var,
             self.trajectory_combo_var,
         )
         for variable in runtime_variables:
@@ -3385,6 +3595,707 @@ class CR3ControlGUI:
         dialog.transient(self.root)
         dialog.grab_set()
 
+    def open_mediapipe_thumb_panel(self) -> None:
+        """Open the MediaPipe thumb follower in a separate child window.
+
+        The follower owns its camera and MediaPipe dependencies in the CRAFT
+        virtual environment.  Keeping it in a subprocess prevents camera
+        windows, MediaPipe model loading, or Dynamixel I/O from blocking the
+        main MuJoCo/Tk control loop.
+        """
+        if self.mediapipe_panel is not None:
+            try:
+                if self.mediapipe_panel.winfo_exists():
+                    self.mediapipe_panel.deiconify()
+                    self.mediapipe_panel.lift()
+                    self.mediapipe_panel.focus_force()
+                    return
+            except tk.TclError:
+                pass
+
+        panel = tk.Toplevel(self.root)
+        self.mediapipe_panel = panel
+        panel.title(self._tr("MediaPipe 拇指控制", "MediaPipe Thumb Control"))
+        panel.geometry("650x720")
+        panel.minsize(560, 620)
+        panel.configure(bg="#0b1220")
+        panel.transient(self.root)
+        panel.protocol("WM_DELETE_WINDOW", self._close_mediapipe_panel)
+
+        frame = ttk.Frame(panel, padding=16, style="Card.TFrame")
+        frame.pack(fill=tk.BOTH, expand=True)
+        frame.columnconfigure(1, weight=1)
+
+        values = self.mediapipe_panel_vars
+
+        def var(name: str, default: str) -> tk.StringVar:
+            existing = values.get(name)
+            if isinstance(existing, tk.StringVar):
+                return existing
+            result = tk.StringVar(value=default)
+            values[name] = result
+            return result
+
+        camera_var = var("camera", "1")
+        port_var = var("motor_port", "")
+        baud_var = var("baud", "")
+        current_var = var("current_ma", "350")
+        control_hz_var = var("control_hz", "20")
+        max_step_var = var("max_position_step_rad", "0.05")
+        opposition_var = var("max_opposition", "0.20")
+        touch_var = var("touch_distance", "0.12")
+        open_var = var("open_distance", "0.70")
+        switch_var = var("switch_margin", "0.08")
+        thumb_smoothing_var = var("thumb_smoothing", "0.70")
+        smoothing_var = var("smoothing", "0.45")
+        max_close_var = var("max_close", "0.30")
+        live_var = values.get("live")
+        if not isinstance(live_var, tk.BooleanVar):
+            live_var = tk.BooleanVar(value=False)
+            values["live"] = live_var
+
+        ttk.Label(
+            frame,
+            text=self._tr(
+                "MediaPipe 拇指对掌控制（独立子页面）",
+                "MediaPipe thumb opposition control (separate window)",
+            ),
+            style="Header.TLabel",
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
+
+        def add_entry(row: int, chinese: str, english: str, variable) -> None:
+            ttk.Label(frame, text=self._tr(chinese, english)).grid(
+                row=row, column=0, sticky="w", pady=3
+            )
+            ttk.Entry(frame, textvariable=variable).grid(
+                row=row, column=1, sticky="ew", padx=(14, 0), pady=3
+            )
+
+        add_entry(1, "摄像头编号", "Camera index", camera_var)
+        add_entry(2, "电机串口（预览可留空）", "Motor port (optional in preview)", port_var)
+        add_entry(3, "波特率（可留空）", "Baud rate (optional)", baud_var)
+        add_entry(4, "电机电流 (mA)", "Motor current (mA)", current_var)
+        add_entry(5, "控制频率 (Hz)", "Control rate (Hz)", control_hz_var)
+        add_entry(6, "最大位置步长 (rad)", "Max position step (rad)", max_step_var)
+        add_entry(7, "最大拇指对掌幅度", "Max thumb opposition", opposition_var)
+        add_entry(8, "接触距离", "Touch distance", touch_var)
+        add_entry(9, "张开距离", "Open distance", open_var)
+        add_entry(10, "目标切换裕量", "Target switch margin", switch_var)
+        add_entry(11, "拇指滤波", "Thumb smoothing", thumb_smoothing_var)
+        add_entry(12, "整体滤波", "Overall smoothing", smoothing_var)
+        add_entry(13, "最大闭合比例", "Max close", max_close_var)
+
+        ttk.Checkbutton(
+            frame,
+            text=self._tr("实机输出（谨慎）", "Live hardware output (caution)"),
+            variable=live_var,
+            style="Card.TCheckbutton",
+        ).grid(row=14, column=0, columnspan=2, sticky="w", pady=(8, 2))
+        ttk.Label(
+            frame,
+            text=self._tr(
+                "启动后会打开独立的摄像头窗口；默认只预览，不驱动灵巧手。\n"
+                "摄像头窗口快捷键：Space 锁定/恢复，m 扭矩关闭/恢复，q 退出。",
+                "Start opens a separate camera window; preview is default and does not drive the hand.\n"
+                "Camera-window keys: Space lock/resume, m torque off/resume, q quit.",
+            ),
+            wraplength=590,
+            justify=tk.LEFT,
+            style="Card.TLabel",
+        ).grid(row=15, column=0, columnspan=2, sticky="w", pady=(8, 8))
+
+        self.mediapipe_start_button = ttk.Button(
+            frame,
+            text=self._tr("启动 MediaPipe", "Start MediaPipe"),
+            command=self.toggle_mediapipe_thumb,
+        )
+        self.mediapipe_start_button.grid(
+            row=16, column=0, columnspan=2, sticky="ew", pady=(2, 8)
+        )
+        ttk.Label(
+            frame,
+            textvariable=self.mediapipe_status_var,
+            style="Card.TLabel",
+            wraplength=590,
+        ).grid(row=17, column=0, columnspan=2, sticky="w")
+
+    def toggle_mediapipe_thumb(self) -> None:
+        process = self.mediapipe_process
+        if process is not None and process.poll() is None:
+            self.stop_mediapipe_thumb()
+        else:
+            self.start_mediapipe_thumb()
+
+    def _mediapipe_float(self, name: str, low: float, high: float) -> float:
+        variable = self.mediapipe_panel_vars[name]
+        try:
+            value = float(variable.get())
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name} 必须是数字") from exc
+        if not np.isfinite(value) or not low <= value <= high:
+            raise ValueError(f"{name} 必须在 {low:g} 到 {high:g} 之间")
+        return value
+
+    def start_mediapipe_thumb(self) -> None:
+        if self.mediapipe_process is not None and self.mediapipe_process.poll() is None:
+            return
+        if self.mediapipe_panel is None or not self.mediapipe_panel_vars:
+            self.open_mediapipe_thumb_panel()
+        try:
+            camera = int(self.mediapipe_panel_vars["camera"].get())
+            if camera < 0:
+                raise ValueError("camera index must be non-negative")
+            current_ma = int(self.mediapipe_panel_vars["current_ma"].get())
+            if not 50 <= current_ma <= 1000:
+                raise ValueError("电机电流必须在 50 到 1000 mA 之间")
+            control_hz = self._mediapipe_float("control_hz", 1.0, 60.0)
+            max_step = self._mediapipe_float(
+                "max_position_step_rad", 0.001, 1.0
+            )
+            max_opposition = self._mediapipe_float("max_opposition", 0.0, 1.0)
+            touch_distance = self._mediapipe_float("touch_distance", 0.0, 2.0)
+            open_distance = self._mediapipe_float("open_distance", 0.0, 2.0)
+            if open_distance <= touch_distance:
+                raise ValueError("张开距离必须大于接触距离")
+            switch_margin = self._mediapipe_float("switch_margin", 0.0, 1.0)
+            thumb_smoothing = self._mediapipe_float(
+                "thumb_smoothing", 0.0, 0.999
+            )
+            smoothing = self._mediapipe_float("smoothing", 0.0, 1.0)
+            max_close = self._mediapipe_float("max_close", 0.0, 1.0)
+            baud_text = self.mediapipe_panel_vars["baud"].get().strip()
+            baud = None if not baud_text else int(baud_text)
+            if baud is not None and not 1 <= baud <= 10_000_000:
+                raise ValueError("波特率必须在 1 到 10000000 之间")
+            motor_port = self.mediapipe_panel_vars["motor_port"].get().strip()
+            live = bool(self.mediapipe_panel_vars["live"].get())
+        except (TypeError, ValueError) as exc:
+            messagebox.showerror(
+                self._tr("MediaPipe 参数无效", "Invalid MediaPipe Settings"),
+                str(exc),
+                parent=self.mediapipe_panel,
+            )
+            return
+
+        if not CRAFT_MEDIAPIPE_SCRIPT.is_file():
+            self.mediapipe_status_var.set(
+                f"MediaPipe 脚本不存在：{CRAFT_MEDIAPIPE_SCRIPT}"
+            )
+            self.log(f"未找到 MediaPipe 拇指脚本：{CRAFT_MEDIAPIPE_SCRIPT}")
+            return
+        if not CRAFT_HAND_PYTHON.is_file():
+            self.mediapipe_status_var.set(
+                f"CRAFT Python 不存在：{CRAFT_HAND_PYTHON}"
+            )
+            self.log(f"未找到 CRAFT Python：{CRAFT_HAND_PYTHON}")
+            return
+        if live and not messagebox.askyesno(
+            self._tr("启动 MediaPipe 实机输出", "Start MediaPipe Live Output"),
+            self._tr(
+                "这会通过 Dynamixel 控制 CRAFT 灵巧手，不会控制 CR3 机械臂。\n\n"
+                "请确认灵巧手周围没有障碍物，并确认电机电流和限位参数安全。",
+                "This controls the CRAFT hand through Dynamixel; it does not control the CR3 arm.\n\n"
+                "Confirm the hand workspace is clear and the current/limits are safe.",
+            ),
+            icon="warning",
+            parent=self.mediapipe_panel,
+        ):
+            return
+
+        command = [
+            str(CRAFT_HAND_PYTHON),
+            str(CRAFT_MEDIAPIPE_SCRIPT),
+            "--camera", str(camera),
+            "--current-ma", str(current_ma),
+            "--control-hz", f"{control_hz:g}",
+            "--max-position-step-rad", f"{max_step:g}",
+            "--max-opposition", f"{max_opposition:g}",
+            "--touch-distance", f"{touch_distance:g}",
+            "--open-distance", f"{open_distance:g}",
+            "--switch-margin", f"{switch_margin:g}",
+            "--thumb-smoothing", f"{thumb_smoothing:g}",
+            "--smoothing", f"{smoothing:g}",
+            "--max-close", f"{max_close:g}",
+        ]
+        if motor_port:
+            command.extend(("--motor-port", motor_port))
+        if baud is not None:
+            command.extend(("--baud", str(baud)))
+        if live:
+            command.append("--live")
+
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=str(CRAFT_HAND_REPO / "python"),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except (OSError, ValueError) as exc:
+            self.mediapipe_status_var.set(f"MediaPipe 启动失败：{exc}")
+            self.log(f"MediaPipe 启动失败：{exc}")
+            return
+
+        self.mediapipe_process = process
+        mode_text = "实机输出" if live else "预览"
+        self.mediapipe_status_var.set(
+            f"MediaPipe 进程运行中 · {mode_text} · camera={camera}"
+        )
+        self._set_button_text(self.mediapipe_start_button, "停止 MediaPipe")
+        self.log(f"MediaPipe 拇指控制已启动（{mode_text}）。")
+
+        def read_output() -> None:
+            if process.stdout is None:
+                return
+            for line in process.stdout:
+                message = line.rstrip()
+                if message:
+                    self.ui_events.put((self._handle_mediapipe_output, message))
+
+        self.mediapipe_output_thread = threading.Thread(
+            target=read_output,
+            name="mediapipe-thumb-output",
+            daemon=True,
+        )
+        self.mediapipe_output_thread.start()
+
+    def _handle_mediapipe_output(self, message: str) -> None:
+        self.log(f"[MediaPipe] {message}")
+        if "SETUP ERROR" in message or "Traceback" in message:
+            self.mediapipe_status_var.set(f"MediaPipe 错误：{message}")
+
+    def _check_mediapipe_process(self) -> None:
+        process = self.mediapipe_process
+        if process is None:
+            return
+        return_code = process.poll()
+        if return_code is None:
+            return
+        self.mediapipe_process = None
+        self._set_button_text(self.mediapipe_start_button, "启动 MediaPipe")
+        if return_code == 0:
+            self.mediapipe_status_var.set("MediaPipe 已停止")
+        else:
+            self.mediapipe_status_var.set(
+                f"MediaPipe 已退出（code={return_code}）"
+            )
+        self.log(f"MediaPipe 拇指控制进程已退出（code={return_code}）。")
+
+    def stop_mediapipe_thumb(self) -> None:
+        process = self.mediapipe_process
+        self.mediapipe_process = None
+        if process is None:
+            self._set_button_text(self.mediapipe_start_button, "启动 MediaPipe")
+            self.mediapipe_status_var.set("MediaPipe 未启动")
+            return
+        if process.poll() is None:
+            try:
+                process.terminate()
+                process.wait(timeout=2.0)
+            except (OSError, subprocess.TimeoutExpired):
+                try:
+                    process.kill()
+                except OSError:
+                    pass
+        self._set_button_text(self.mediapipe_start_button, "启动 MediaPipe")
+        self.mediapipe_status_var.set("MediaPipe 已停止")
+        self.log("MediaPipe 拇指控制已停止。")
+
+    def _close_mediapipe_panel(self) -> None:
+        if self.mediapipe_process is not None and self.mediapipe_process.poll() is None:
+            if not messagebox.askyesno(
+                self._tr("关闭 MediaPipe 页面", "Close MediaPipe Panel"),
+                self._tr(
+                    "MediaPipe 进程仍在运行；关闭页面时也会停止它。\n\n继续吗？",
+                    "The MediaPipe process is still running; closing this panel will stop it.\n\nContinue?",
+                ),
+                icon="warning",
+                parent=self.mediapipe_panel,
+            ):
+                return
+            self.stop_mediapipe_thumb()
+        panel = self.mediapipe_panel
+        self.mediapipe_panel = None
+        if panel is not None:
+            try:
+                panel.destroy()
+            except tk.TclError:
+                pass
+
+    # The methods below intentionally supersede the legacy subprocess/
+    # Toplevel implementation above.  Keeping the old block in the history
+    # makes the migration easy to review, while these definitions are the
+    # active implementation used by the class.
+    def _load_mediapipe_modules(self):
+        python_dir = str(CRAFT_HAND_REPO / "python")
+        if python_dir not in sys.path:
+            sys.path.insert(0, python_dir)
+        thumb = importlib.import_module("mediapipe_thumb_opposition_follow")
+        direct = importlib.import_module("mediapipe_direct_follow")
+        return thumb, direct
+
+    def open_mediapipe_thumb_panel(self) -> None:
+        """Show/hide the embedded MediaPipe child page."""
+        panel = self.mediapipe_panel
+        if panel is None:
+            return
+        try:
+            if panel.winfo_ismapped():
+                panel.place_forget()
+                self.log("MediaPipe 子页面已折叠。")
+            else:
+                # Overlay the right control column instead of inserting a
+                # frame below the existing controls.  This is a child page
+                # inside the same Tk window, not a second top-level window.
+                panel.grid_forget()
+                panel.place(relx=0.0, rely=0.0, relwidth=1.0, relheight=1.0)
+                panel.lift()
+                self.log("MediaPipe 子页面已打开；摄像头画面嵌入当前窗口。")
+        except tk.TclError:
+            return
+
+    def toggle_mediapipe_thumb(self) -> None:
+        """Start/stop the embedded worker (never a subprocess/window)."""
+        thread = self.mediapipe_thread
+        if thread is not None and thread.is_alive():
+            self.stop_mediapipe_thumb()
+        else:
+            self.start_mediapipe_thumb()
+
+    def _queue_mediapipe_command(self, command: str) -> None:
+        if self.mediapipe_thread is None or not self.mediapipe_thread.is_alive():
+            self.mediapipe_status_var.set(
+                self._tr("请先启动 MediaPipe", "Start MediaPipe first")
+            )
+            return
+        self.mediapipe_command_queue.put(command)
+
+    def toggle_mediapipe_lock(self) -> None:
+        self._queue_mediapipe_command("toggle_lock")
+
+    def _mediapipe_float(self, name: str, low: float, high: float) -> float:
+        variable = self.mediapipe_panel_vars[name]
+        try:
+            value = float(variable.get())
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name} 必须是数字") from exc
+        if not np.isfinite(value) or not low <= value <= high:
+            raise ValueError(f"{name} 必须在 {low:g} 到 {high:g} 之间")
+        return value
+
+    def start_mediapipe_thumb(self) -> None:
+        if self.mediapipe_thread is not None and self.mediapipe_thread.is_alive():
+            return
+        if not CRAFT_MEDIAPIPE_SCRIPT.is_file():
+            self.mediapipe_status_var.set(f"MediaPipe 脚本不存在：{CRAFT_MEDIAPIPE_SCRIPT}")
+            self.log(f"未找到 MediaPipe 拇指脚本：{CRAFT_MEDIAPIPE_SCRIPT}")
+            return
+        try:
+            camera = int(self.mediapipe_panel_vars["camera"].get())
+            if camera < 0:
+                raise ValueError("camera index must be non-negative")
+            current_ma = int(self.mediapipe_panel_vars["current_ma"].get())
+            if not 50 <= current_ma <= 1000:
+                raise ValueError("电机电流必须在 50 到 1000 mA 之间")
+            control_hz = self._mediapipe_float("control_hz", 1.0, 60.0)
+            max_step = self._mediapipe_float("max_position_step_rad", 0.001, 1.0)
+            max_opposition = self._mediapipe_float("max_opposition", 0.0, 1.0)
+            touch_distance = self._mediapipe_float("touch_distance", 0.0, 2.0)
+            open_distance = self._mediapipe_float("open_distance", 0.0, 2.0)
+            if open_distance <= touch_distance:
+                raise ValueError("张开距离必须大于接触距离")
+            switch_margin = self._mediapipe_float("switch_margin", 0.0, 1.0)
+            thumb_smoothing = self._mediapipe_float("thumb_smoothing", 0.0, 0.999)
+            smoothing = self._mediapipe_float("smoothing", 0.0, 1.0)
+            max_close = self._mediapipe_float("max_close", 0.0, 1.0)
+            baud_text = self.mediapipe_panel_vars["baud"].get().strip()
+            baud = None if not baud_text else int(baud_text)
+            if baud is not None and not 1 <= baud <= 10_000_000:
+                raise ValueError("波特率必须在 1 到 10000000 之间")
+            motor_port = self.mediapipe_panel_vars["motor_port"].get().strip()
+            live = bool(self.mediapipe_panel_vars["live"].get())
+        except (TypeError, ValueError) as exc:
+            messagebox.showerror(
+                self._tr("MediaPipe 参数无效", "Invalid MediaPipe Settings"),
+                str(exc),
+                parent=self.root,
+            )
+            return
+        if live and not messagebox.askyesno(
+            self._tr("启动 MediaPipe 实机输出", "Start MediaPipe Live Output"),
+            self._tr(
+                "这会控制 CRAFT 灵巧手，不会控制 CR3。请确认工作区安全。",
+                "This controls the CRAFT hand, not the CR3. Confirm the workspace is safe.",
+            ),
+            icon="warning",
+            parent=self.root,
+        ):
+            return
+
+        self.mediapipe_stop_event.clear()
+        while True:
+            try:
+                self.mediapipe_command_queue.get_nowait()
+            except queue.Empty:
+                break
+        settings = {
+            "camera": camera,
+            "current_ma": current_ma,
+            "control_hz": control_hz,
+            "max_position_step_rad": max_step,
+            "max_opposition": max_opposition,
+            "touch_distance": touch_distance,
+            "open_distance": open_distance,
+            "switch_margin": switch_margin,
+            "thumb_smoothing": thumb_smoothing,
+            "smoothing": smoothing,
+            "max_close": max_close,
+            "motor_port": motor_port,
+            "baud": baud,
+            "live": live,
+        }
+        self.mediapipe_status_var.set(
+            self._tr("正在启动 MediaPipe…", "Starting MediaPipe…")
+        )
+        self._set_button_text(self.mediapipe_start_button, "停止 MediaPipe")
+        self.mediapipe_thread = threading.Thread(
+            target=self._mediapipe_worker,
+            args=(settings,),
+            name="embedded-mediapipe-thumb",
+            daemon=True,
+        )
+        self.mediapipe_thread.start()
+        self.log(
+            "MediaPipe 已启动（实机输出）。"
+            if live
+            else "MediaPipe 已启动（仅预览，不驱动灵巧手）。"
+        )
+
+    def _mediapipe_worker(self, settings: dict) -> None:
+        hardware = None
+        cap = None
+        try:
+            thumb, direct = self._load_mediapipe_modules()
+            parser = thumb.make_parser()
+            args = parser.parse_args([])
+            args.camera = settings["camera"]
+            args.current_ma = settings["current_ma"]
+            args.control_hz = settings["control_hz"]
+            args.max_position_step_rad = settings["max_position_step_rad"]
+            args.max_opposition = settings["max_opposition"]
+            args.touch_distance = settings["touch_distance"]
+            args.open_distance = settings["open_distance"]
+            args.switch_margin = settings["switch_margin"]
+            args.thumb_smoothing = settings["thumb_smoothing"]
+            args.smoothing = settings["smoothing"]
+            args.max_close = settings["max_close"]
+            args.positions_path = thumb.DEFAULT_POSITIONS
+            args.anchors = thumb.DEFAULT_ANCHORS
+            anchors = thumb.load_hardware_anchors(args.anchors)
+            saved_positions = thumb.load_saved_positions(args.positions_path)
+            args.port = settings["motor_port"] or anchors.get("port_at_capture") or "COM11"
+            args.baud = settings["baud"] or int(anchors.get("baud_at_capture", 57600))
+            if settings["live"]:
+                hardware = direct.DirectHardwareFollower(args)
+
+            cv2, mp = direct.import_vision_deps()
+            use_solutions = hasattr(mp, "solutions")
+            if use_solutions:
+                mp_hands = mp.solutions.hands
+                mp_draw = mp.solutions.drawing_utils
+                hands_context = mp_hands.Hands(
+                    static_image_mode=False,
+                    max_num_hands=1,
+                    model_complexity=1,
+                    min_detection_confidence=0.6,
+                    min_tracking_confidence=0.6,
+                )
+            else:
+                hands_context = direct.create_task_landmarker(mp)
+            cap = cv2.VideoCapture(args.camera)
+            if not cap.isOpened():
+                raise RuntimeError(f"Could not open camera index {args.camera}")
+
+            smoothed_alphas = None
+            smoothed_thumb = thumb.thumb_pose(anchors, "open")
+            smoothed_strength = 0.0
+            selected_target = None
+            motor_position_locked = False
+            active_position_slot = None
+            manual_position_mode = False
+            last_manual_toggle = 0.0
+            latest_distances = {name: 99.0 for name in thumb.TARGET_TIPS}
+            latest_alphas = {key: 0.0 for key in direct.ACTIVE_CHANNELS}
+            if hardware is not None:
+                hardware.set_target_motor_overrides(dict(zip(thumb.THUMB_MOTOR_IDS, smoothed_thumb)))
+
+            with hands_context as hands:
+                while not self.mediapipe_stop_event.is_set():
+                    # GUI buttons are translated into the same state machine as
+                    # the original s/1/2/Space/m keyboard controls.
+                    while True:
+                        try:
+                            command = self.mediapipe_command_queue.get_nowait()
+                        except queue.Empty:
+                            break
+                        if command == "toggle_lock":
+                            if not manual_position_mode:
+                                motor_position_locked = not motor_position_locked
+                                active_position_slot = None if not motor_position_locked else active_position_slot
+                                if hardware is not None:
+                                    hardware.set_position_locked(motor_position_locked)
+                                    if not motor_position_locked:
+                                        hardware.set_target_motor_positions(None)
+                                self.ui_events.put((self._handle_mediapipe_worker_event, "锁定目标" if motor_position_locked else "已恢复跟随"))
+                        elif command == "resume":
+                            motor_position_locked = False
+                            active_position_slot = None
+                            if hardware is not None:
+                                hardware.set_position_locked(False)
+                                hardware.set_target_motor_positions(None)
+                            self.ui_events.put((self._handle_mediapipe_worker_event, "已恢复跟随"))
+                        elif command.startswith("save:"):
+                            slot = command.split(":", 1)[1]
+                            if hardware is None:
+                                self.ui_events.put((self._handle_mediapipe_worker_event, "预览模式不能读取电机位置；请勾选实机输出"))
+                            else:
+                                saved_positions[slot] = hardware.read_motor_positions() if manual_position_mode else hardware.get_last_commanded_target()
+                                thumb.save_saved_positions(args.positions_path, saved_positions)
+                                self.ui_events.put((self._handle_mediapipe_worker_event, f"位置 {slot} 已保存到 {args.positions_path.name}"))
+                        elif command.startswith("use:"):
+                            slot = command.split(":", 1)[1]
+                            if manual_position_mode:
+                                self.ui_events.put((self._handle_mediapipe_worker_event, "请先恢复扭矩，再调用保存位置"))
+                            elif slot not in saved_positions:
+                                self.ui_events.put((self._handle_mediapipe_worker_event, f"位置 {slot} 尚未保存"))
+                            else:
+                                motor_position_locked = True
+                                active_position_slot = slot
+                                if hardware is not None:
+                                    hardware.set_target_motor_positions(saved_positions[slot])
+                                    hardware.set_position_locked(True)
+                                self.ui_events.put((self._handle_mediapipe_worker_event, f"已调用位置 {slot}"))
+
+                    ok, frame = cap.read()
+                    if not ok:
+                        raise RuntimeError("Camera read failed")
+                    frame = cv2.flip(frame, 1)
+                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    if use_solutions:
+                        results = hands.process(rgb)
+                        landmarks_list = [results.multi_hand_landmarks[0].landmark] if results.multi_hand_landmarks else []
+                        drawable = results.multi_hand_landmarks[0] if results.multi_hand_landmarks else None
+                    else:
+                        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                        results = hands.detect_for_video(mp_image, int(time.time() * 1000))
+                        landmarks_list = results.hand_landmarks
+                        drawable = None
+                    hand_seen = bool(landmarks_list)
+                    if hand_seen:
+                        landmarks = landmarks_list[0]
+                        if use_solutions:
+                            mp_draw.draw_landmarks(frame, drawable, mp_hands.HAND_CONNECTIONS)
+                        else:
+                            direct.draw_task_landmarks(cv2, frame, landmarks)
+                        alphas, _raw = direct.compute_channel_alphas(landmarks, args)
+                        alphas["thumb_mcp"] = 0.0
+                        alphas["thumb_pip"] = 0.0
+                        smoothed_alphas = direct.smooth_alphas(smoothed_alphas, alphas, args.smoothing)
+                        latest_alphas = smoothed_alphas
+                        latest_distances = thumb.fingertip_distances(landmarks)
+                        selected_target = thumb.select_target(latest_distances, selected_target, args.switch_margin)
+                        raw_strength = thumb.contact_strength(latest_distances[selected_target], args.touch_distance, args.open_distance)
+                        smoothed_strength = args.thumb_smoothing * smoothed_strength + (1.0 - args.thumb_smoothing) * raw_strength
+                        raw_thumb = thumb.blended_thumb_pose(anchors, selected_target, smoothed_strength, args.max_opposition)
+                        smoothed_thumb = args.thumb_smoothing * smoothed_thumb + (1.0 - args.thumb_smoothing) * raw_thumb
+                        if hardware is not None and not motor_position_locked:
+                            hardware.set_target_alphas(latest_alphas)
+                            hardware.set_target_motor_overrides(dict(zip(thumb.THUMB_MOTOR_IDS, smoothed_thumb)))
+                    short_target = "none" if selected_target is None else selected_target.replace("thumb_to_", "")
+                    status = [
+                        "GUI: lock/resume | Save 1/2 | Use 1/2",
+                        f"hand={'seen' if hand_seen else 'lost-hold'} target={short_target}",
+                        f"strength={smoothed_strength:.2f} max={args.max_opposition:.2f}",
+                        "motor=MANUAL" if manual_position_mode else f"motor=LOCKED ({active_position_slot or 'last'})" if motor_position_locked else "motor=FOLLOW",
+                        f"saved=1:{'yes' if '1' in saved_positions else 'no'} 2:{'yes' if '2' in saved_positions else 'no'}",
+                        f"hardware={'LIVE' if hardware is not None else 'OFF'}",
+                    ]
+                    direct.draw_status(cv2, frame, status)
+                    with self.mediapipe_frame_lock:
+                        self.mediapipe_latest_frame = frame.copy()
+            self.ui_events.put((self._handle_mediapipe_worker_event, "MediaPipe 已停止"))
+        except Exception as exc:
+            self.ui_events.put((self._handle_mediapipe_worker_event, f"MediaPipe 错误：{exc}"))
+        finally:
+            if cap is not None:
+                cap.release()
+            if hardware is not None:
+                hardware.close()
+
+    def _handle_mediapipe_worker_event(self, message: str) -> None:
+        self.mediapipe_status_var.set(message)
+        if message == "锁定目标":
+            self._set_button_text(self.mediapipe_lock_button, "恢复跟随")
+        elif message == "已恢复跟随" or message == "恢复跟随":
+            self._set_button_text(self.mediapipe_lock_button, "锁定目标")
+        if message.startswith("MediaPipe 错误"):
+            self.log(message)
+        elif "已保存" in message or "已调用" in message or "锁定" in message or "跟随" in message:
+            self.log(message)
+
+    def _refresh_mediapipe_frame(self) -> None:
+        preview = self.mediapipe_preview
+        if preview is None:
+            return
+        with self.mediapipe_frame_lock:
+            frame = None if self.mediapipe_latest_frame is None else self.mediapipe_latest_frame.copy()
+        if frame is None:
+            return
+        image = Image.fromarray(frame[:, :, ::-1])
+        width = max(preview.winfo_width(), 320)
+        height = max(preview.winfo_height(), 180)
+        image.thumbnail((width, height), Image.Resampling.LANCZOS)
+        self.mediapipe_photo = ImageTk.PhotoImage(image=image)
+        preview.configure(image=self.mediapipe_photo, text="")
+
+    def _check_mediapipe_process(self) -> None:
+        thread = self.mediapipe_thread
+        if thread is None:
+            return
+        if thread.is_alive():
+            self._refresh_mediapipe_frame()
+            return
+        self.mediapipe_thread = None
+        self._set_button_text(self.mediapipe_start_button, "启动 MediaPipe")
+        if self.mediapipe_status_var.get() == "正在启动 MediaPipe…":
+            self.mediapipe_status_var.set("MediaPipe 已停止")
+
+    def stop_mediapipe_thumb(self) -> None:
+        thread = self.mediapipe_thread
+        if thread is None:
+            self._set_button_text(self.mediapipe_start_button, "启动 MediaPipe")
+            return
+        self.mediapipe_stop_event.set()
+        if thread is not threading.current_thread():
+            thread.join(timeout=1.5)
+        self.mediapipe_thread = None
+        self._set_button_text(self.mediapipe_start_button, "启动 MediaPipe")
+        self._set_button_text(self.mediapipe_lock_button, "锁定目标")
+        self.mediapipe_status_var.set("MediaPipe 已停止")
+        self.log("MediaPipe 拇指控制已停止。")
+
+    def _close_mediapipe_panel(self) -> None:
+        # Closing now means collapsing the child page, not destroying a
+        # separate window.  A running worker is intentionally left running;
+        # the Stop button remains available after reopening the page.
+        self.open_mediapipe_thumb_panel()
+
     def _quest_target_rotation(self, snapshot) -> np.ndarray | None:
         if not self.quest_orientation_mode_var.get():
             return None
@@ -4478,6 +5389,7 @@ class CR3ControlGUI:
         self._update_quest(now)
         self._update_quest_mocap(now)
         self._check_quest_hand_follower()
+        self._check_mediapipe_process()
         self._check_quest_real_sync(now)
 
         try:
@@ -4957,6 +5869,14 @@ class CR3ControlGUI:
             self.stop_quest_hand_follower()
             self.quest_receiver.stop()
             self.quest_receiver = None
+        if self.mediapipe_thread is not None:
+            self.stop_mediapipe_thumb()
+        if self.mediapipe_panel is not None:
+            try:
+                self.mediapipe_panel.destroy()
+            except tk.TclError:
+                pass
+            self.mediapipe_panel = None
         self.renderer.close()
         self.root.destroy()
 
