@@ -358,17 +358,43 @@ def execute_real_trajectory(
         real_start = state.joints_deg
         expected_start = sim_rad_to_real_deg(recorder.points[0].q)
         start_error = float(np.max(np.abs(real_start - expected_start)))
-        if start_error > REAL_START_TOLERANCE_DEG:
-            raise RuntimeError(
-                f"Real start pose differs by {start_error:.3f} deg; "
-                f"limit is {REAL_START_TOLERANCE_DEG:.3f} deg"
-            )
         samples = resample_joint_trajectory(
             recorder.points,
             sample_period=LIVE_SERVO_PERIOD_S,
         )
-        real_stream = [
+        trajectory_stream = [
             (point.time, sim_rad_to_real_deg(point.q)) for point in samples
+        ]
+        # Move directly from the live pose to the trajectory start before
+        # playing back, instead of aborting on a start-pose mismatch. The ramp
+        # begins exactly at the connect-time pose (the hardware tracking
+        # baseline) and the shared velocity limiter also caps it. When already
+        # at the start, only anchor the baseline with a single idle waypoint.
+        if start_error > REAL_START_TOLERANCE_DEG:
+            ramp_speed = min(
+                DEFAULT_LIVE_JOINT_SPEED_DEG_S,
+                CR3_MAX_JOINT_SPEED_DEG_S * speed_percent / 100,
+            )
+            ramp_duration = max(2.0, start_error / ramp_speed)
+            ramp_count = int(ramp_duration / LIVE_SERVO_PERIOD_S) + 1
+            ramp = [
+                (
+                    float(index * LIVE_SERVO_PERIOD_S),
+                    real_start
+                    + (expected_start - real_start) * index / (ramp_count - 1),
+                )
+                for index in range(ramp_count)
+            ]
+            print(
+                f"Moving real robot to trajectory start: "
+                f"{start_error:.3f} deg away ({ramp_duration:.1f} s ramp)"
+            )
+        else:
+            ramp = [(0.0, real_start.copy())]
+            ramp_count = 1
+        offset = ramp_count * LIVE_SERVO_PERIOD_S
+        real_stream = ramp + [
+            (time + offset, waypoint) for time, waypoint in trajectory_stream
         ]
         hardware.execute(real_stream, stop_event=stop_event)
     finally:

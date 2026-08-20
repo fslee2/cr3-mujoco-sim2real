@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import ipaddress
+import json
 import math
 from pathlib import Path
 import queue
@@ -11,7 +12,7 @@ import subprocess
 import threading
 import time
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 import mujoco
 import numpy as np
@@ -55,7 +56,6 @@ from cr3_sim2real.quest_hand import (
 )
 from cr3_sim2real.trajectory import (
     TrajectoryRecorder,
-    build_servoj_dry_run,
     validate_trajectory,
 )
 
@@ -110,7 +110,6 @@ UI_TEXT_EN = {
     "控制器遥测：等待实机反馈": "Controller telemetry: waiting for feedback",
     "关节力学：等待实机反馈": "Joint mechanics: waiting for feedback",
     "TCP / 六维力：等待实机反馈": "TCP / 6-axis force: waiting for feedback",
-    "未武装": "Not armed",
     "实时同步未启动": "Live sync inactive",
     "示教拖拽未启动": "Teaching inactive",
     "实机连接与安全": "Robot Connection & Safety",
@@ -187,9 +186,16 @@ UI_TEXT_EN = {
     "停止记录  [KP Enter]": "Stop  [Enter]",
     "仿真 Home  [KP 5]": "Home  [KP 5]",
     "清空轨迹  [KP /]": "Clear  [KP /]",
-    "武装真实回放": "Arm Playback",
-    "最终确认执行": "Execute",
+    "真实回放  [KP *]": "Replay  [KP *]",
     "重置相机": "Reset Camera",
+    "保存轨迹": "Save Trajectory",
+    "选择已保存轨迹…": "Select saved trajectory…",
+    "已加载，可回放": "Loaded, ready to replay",
+    "真实回放执行中": "Real playback running",
+    "真实回放完成": "Real playback complete",
+    "真实回放已中止": "Real playback aborted",
+    "选择已保存的轨迹文件": "Select a saved trajectory file",
+    "输入轨迹名称（同名会覆盖已有轨迹）：": "Enter a trajectory name (same name overwrites the saved file):",
     "运行日志": "Runtime Log",
     "清空日志": "Clear Log",
     "软件紧急停止  EMERGENCY STOP": "SOFTWARE EMERGENCY STOP",
@@ -241,37 +247,44 @@ LOG_TEXT_EN = {
         "The physical CR3 reached Home; MuJoCo is aligned and existing hand origins were re-anchored to Link6.",
     "实机回 Home 已由用户停止。": "Robot Home was stopped by the user.",
     "DisableRobot() 已在发送中。": "DisableRobot() is already being sent.",
-    "只有仿真录制模式，或已验证的示教拖拽模式可以记录轨迹。":
-        "Trajectories can be recorded only in simulation record mode or verified teaching mode.",
+    "只有仿真录制模式、已验证的示教拖拽模式，或活动的实时同步可以记录轨迹。":
+        "Trajectories can be recorded in simulation record mode, verified teaching mode, or an active live sync.",
+    "实时同步轨迹记录已开始，将随实时同步发送的轨迹采样。":
+        "Live-sync trajectory recording started; samples follow the live-sync command stream.",
     "示教轨迹记录已开始。": "Teaching trajectory recording started.",
     "轨迹记录已开始。": "Trajectory recording started.",
+    "轨迹尚未保存；点击『保存轨迹』可保留，否则会被下一次录制或关闭 GUI 覆盖。":
+        "Trajectory not saved yet; click 'Save Trajectory' to keep it, otherwise a new recording or closing the GUI discards it.",
+    "没有可保存的轨迹；请先录制或加载一条轨迹。":
+        "Nothing to save; record or load a trajectory first.",
+    "请先停止当前记录或回放，再选择轨迹。":
+        "Stop current recording or playback before selecting a trajectory.",
+    "点击『真实回放』或按 KP * 可直接回放该轨迹。":
+        "Click 'Replay' or press KP * to replay this trajectory directly.",
+    "实时同步正在运行；请先停止实时同步，再执行真实回放。":
+        "Live sync is running; stop it before real playback.",
+    "可在下方『选择已保存轨迹』下拉框中选中它，随时点击『真实回放』多次回放。":
+        "Pick it in the 'Select saved trajectory' dropdown to replay it repeatedly via 'Replay'.",
     "轨迹已清空；实体机器人未收到命令。":
         "Trajectory cleared; the physical robot received no command.",
-    "没有已停止并可供检查的轨迹。": "No stopped trajectory is available for review.",
+    "没有可回放的轨迹；请先录制或加载一条轨迹。":
+        "Nothing to replay; record or load a trajectory first.",
     "轨迹安全检查失败：": "Trajectory safety check failed:",
-    "尚未连接 30003，尚未发送运动命令。":
-        "Port 30003 is not connected; no motion command has been sent.",
     "实机运动锁定：请使用 --enable-real-execution 启动 GUI。":
         "Real motion is locked; start the GUI with --enable-real-execution.",
     "软件急停已锁存；请在 DobotStudio 清除并重新使能。":
         "Software E-stop is latched; reset it and re-enable the robot in DobotStudio.",
-    "请先退出示教拖拽，再武装真实回放。": "Exit teaching before arming real playback.",
-    "请先完成轨迹记录和 Dry Run。": "Complete trajectory recording and Dry Run first.",
+    "请先退出示教拖拽，再执行真实回放。": "Exit teaching before real playback.",
     "关节映射未标定，禁止真实回放。": "Joint mapping is not calibrated; real playback is prohibited.",
-    "真实回放已武装 15 秒；尚未发送运动命令。":
-        "Real playback is armed for 15 seconds; no motion command has been sent.",
-    "真实回放武装已过期，请重新武装。": "Real playback arming expired; arm it again.",
-    "用户取消了最终真实回放确认。": "The user cancelled final real-playback confirmation.",
-    "最终确认完成，正在连接并执行低速真实回放。":
-        "Final confirmation accepted; connecting and starting low-speed real playback.",
+    "用户取消了真实回放确认。": "The user cancelled real-playback confirmation.",
+    "确认完成，正在连接并执行低速真实回放。":
+        "Confirmation accepted; connecting and starting low-speed real playback.",
     "真实回放已完成。": "Real playback completed.",
     "30004 只读反馈正常，无需重复连接。": "Port 30004 feedback is healthy; no reconnection is needed.",
     "30004 只读反馈已连接。": "Port 30004 read-only feedback connected.",
     "请先输入目标 IP，并点击“连接 / 切换”。":
         "Enter the target IP and click Connect / Switch first.",
     "当前没有已连接的机器人。": "No robot is currently connected.",
-    "目标 IP 已修改；真实回放武装已取消。":
-        "The target IP changed; real-playback arming was cancelled.",
     "内部连接状态不一致；为安全起见已阻止实机命令，请重新连接反馈。":
         "The internal connection state is inconsistent; robot commands were blocked for safety. Reconnect feedback.",
     "内部连接状态不一致；请使用实体停止并重新连接反馈。":
@@ -362,7 +375,6 @@ LOG_TEXT_EN = {
     "正在先建立共享的 30004 反馈；连接完成后请再次点击“启动实时同步”。":
         "Connecting shared port 30004 feedback first; click Start Live Sync again afterward.",
     "实时同步已停止，本地不再发送 ServoJ。": "Live sync stopped; ServoJ is no longer transmitted.",
-    "真实回放武装已过期。": "Real playback arming expired.",
     "正在进入示教拖拽，请等待状态验证完成后再关闭 GUI。":
         "Teaching is starting; wait for state verification before closing the GUI.",
     "示教模式命令正在执行，请稍候再退出。": "A teaching command is running; wait before exiting.",
@@ -423,13 +435,11 @@ LOG_FRAGMENT_EN = (
     ("机器人 IP 必须是 IPv4 地址", "Robot IP must be an IPv4 address"),
     ("Link6 基准已更新为", "Link6 anchor updated to"),
     ("记录完成：", "Recording completed: "),
-    ("已保存：", "Saved: "),
-    ("Dry Run 通过：", "Dry Run passed: "),
-    ("个连续 ServoJ 采样", " continuous ServoJ samples"),
-    ("个 ServoJ 采样", " ServoJ samples"),
-    ("还有", "remaining"),
-    ("主机限速", "host speed limit"),
-    ("仅保留，ServoJ 不使用", "retained only; unused by ServoJ"),
+    ("已保存轨迹：", "Saved trajectory: "),
+    ("已覆盖同名轨迹：", "Overwrote existing trajectory: "),
+    ("无法保存轨迹：", "Unable to save trajectory: "),
+    ("已加载轨迹：", "Loaded trajectory: "),
+    ("无法加载轨迹：", "Unable to load trajectory: "),
     ("参数无效：", "Invalid parameter: "),
     ("无法将渲染分辨率调整为", "Could not resize rendering resolution to "),
     ("真实回放中止：", "Real playback aborted: "),
@@ -919,8 +929,8 @@ class CR3ControlGUI:
 
         self.recorder = TrajectoryRecorder(sample_period=1.0 / core.RECORD_RATE_HZ)
         self.saved_path: Path | None = None
-        self.dry_run_passed = False
-        self.armed_until = 0.0
+        self._trajectory_files: dict[str, Path] = {}
+        self.trajectory_combo_var = tk.StringVar()
         self.real_busy = False
         self.real_stop_event = threading.Event()
         self.manual_home_active = False
@@ -997,7 +1007,7 @@ class CR3ControlGUI:
         self.io_feedback_var = tk.StringVar(value="控制器遥测：等待实机反馈")
         self.torque_feedback_var = tk.StringVar(value="关节力学：等待实机反馈")
         self.force_feedback_var = tk.StringVar(value="TCP / 六维力：等待实机反馈")
-        self.arm_status_var = tk.StringVar(value="未武装")
+        self.arm_status_var = tk.StringVar(value="")
         self.keyboard_status_var = tk.StringVar(
             value="键盘待命：W/S=Z  A/D=Y  Q/E=X  I/K=RX  J/L=RY  U/O=RZ"
         )
@@ -1022,6 +1032,7 @@ class CR3ControlGUI:
         self.last_applied_live_speed: float | None = None
 
         self._build_ui()
+        self._refresh_trajectory_list()
         self.robot_ip_var.trace_add("write", self._on_robot_ip_edited)
         self._bind_events()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -1034,8 +1045,23 @@ class CR3ControlGUI:
 
     def _build_ui(self) -> None:
         self.root.title("CR3 MuJoCo 数字孪生控制")
-        self.root.geometry("1650x960")
-        self.root.minsize(1320, 820)
+        # Keep the complete two-column control panel inside the usable screen
+        # area.  Relying on the window manager's default placement can put a
+        # 1650px window partly outside a scaled/laptop display, which makes
+        # the right-hand controls look clipped or covered.
+        screen_width = max(int(self.root.winfo_screenwidth()), 1100)
+        screen_height = max(int(self.root.winfo_screenheight()), 760)
+        window_width = min(1650, max(1100, screen_width - 40))
+        window_height = min(960, max(760, screen_height - 80))
+        window_x = max(0, (screen_width - window_width) // 2)
+        window_y = max(0, (screen_height - window_height) // 2)
+        self.root.geometry(
+            f"{window_width}x{window_height}+{window_x}+{window_y}"
+        )
+        self.root.minsize(
+            min(1320, window_width),
+            min(820, window_height),
+        )
         self.root.configure(bg="#0b1220")
 
         style = ttk.Style(self.root)
@@ -1420,27 +1446,31 @@ class CR3ControlGUI:
 
         mode = ttk.LabelFrame(controls, text="控制模式", padding=10, style="Card.TLabelframe")
         mode.grid(row=0, column=1, sticky="nsew", padx=(4, 0), pady=(0, 7))
+        # The three mode radio buttons otherwise keep their natural widths and
+        # can push the last option beyond the right edge of a narrow panel.
+        for column in range(3):
+            mode.columnconfigure(column, weight=1, uniform="control-mode")
         ttk.Radiobutton(
             mode,
             text="录制后回放",
             variable=self.mode_var,
             value="record",
             command=self.on_mode_changed,
-        ).grid(row=0, column=0, sticky="w")
+        ).grid(row=0, column=0, sticky="ew")
         ttk.Radiobutton(
             mode,
             text="实时同步",
             variable=self.mode_var,
             value="live",
             command=self.on_mode_changed,
-        ).grid(row=0, column=1, sticky="w", padx=(18, 0))
+        ).grid(row=0, column=1, sticky="ew", padx=(8, 0))
         ttk.Radiobutton(
             mode,
             text="示教拖拽",
             variable=self.mode_var,
             value="teach",
             command=self.on_mode_changed,
-        ).grid(row=0, column=2, sticky="w", padx=(18, 0))
+        ).grid(row=0, column=2, sticky="ew", padx=(8, 0))
         quest_mode = ttk.Frame(mode, style="Card.TFrame")
         quest_mode.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(8, 0))
         quest_mode.columnconfigure(0, weight=1)
@@ -1639,18 +1669,22 @@ class CR3ControlGUI:
         ttk.Button(trajectory, text="清空轨迹  [KP /]", command=self.clear_trajectory).grid(
             row=1, column=0, sticky="ew", pady=(5, 0)
         )
-        ttk.Button(trajectory, text="Dry Run  [KP *]", command=self.run_dry_review).grid(
+        ttk.Button(trajectory, text="真实回放  [KP *]", command=self.start_real_playback).grid(
             row=1, column=1, sticky="ew", padx=(5, 0), pady=(5, 0)
         )
-        ttk.Button(trajectory, text="武装真实回放", command=self.arm_real_playback).grid(
+        ttk.Button(trajectory, text="保存轨迹", command=self.save_trajectory).grid(
             row=2, column=0, sticky="ew", pady=(5, 0)
         )
-        self.confirm_button = ttk.Button(
-            trajectory, text="最终确认执行", command=self.confirm_real_playback
+        self.trajectory_combo = ttk.Combobox(
+            trajectory,
+            state="readonly",
+            textvariable=self.trajectory_combo_var,
+            width=22,
         )
-        self.confirm_button.grid(
+        self.trajectory_combo.grid(
             row=2, column=1, sticky="ew", padx=(5, 0), pady=(5, 0)
         )
+        self.trajectory_combo.bind("<<ComboboxSelected>>", self.load_trajectory)
         ttk.Button(trajectory, text="重置相机", command=self.reset_camera).grid(
             row=3, column=0, columnspan=2, sticky="ew", pady=(5, 0)
         )
@@ -1749,6 +1783,7 @@ class CR3ControlGUI:
             self.live_speed_status_var,
             self.teach_status_var,
             self.quest_status_var,
+            self.trajectory_combo_var,
         )
         for variable in runtime_variables:
             current = variable.get()
@@ -1915,8 +1950,8 @@ class CR3ControlGUI:
         if event.keysym == "KP_Enter":
             if self.recorder.recording:
                 self.stop_recording()
-            elif self.recorder.review_ready and self.dry_run_passed:
-                self.arm_real_playback()
+            elif self.recorder.review_ready:
+                self.start_real_playback()
             else:
                 self.start_recording()
             return "break"
@@ -1929,10 +1964,7 @@ class CR3ControlGUI:
             self.clear_trajectory()
             return "break"
         if event.keysym == "KP_Multiply":
-            if self.armed_until > 0.0:
-                self.confirm_real_playback()
-            else:
-                self.run_dry_review()
+            self.start_real_playback()
             return "break"
         if event.keysym.lower() == "r":
             if self.mode_var.get() == "quest":
@@ -1942,9 +1974,6 @@ class CR3ControlGUI:
             return "break"
         if event.keysym.lower() == "c":
             self.clear_trajectory()
-            return "break"
-        if event.keysym.lower() == "v":
-            self.run_dry_review()
             return "break"
         if event.keysym.lower() == "h":
             self.go_home()
@@ -2024,7 +2053,16 @@ class CR3ControlGUI:
         self.root.after(20, self._clear_keys_if_window_inactive)
 
     def _clear_keys_if_window_inactive(self) -> None:
-        if self.root.focus_get() is None:
+        # ttk Combobox creates a transient ``popdown`` to show its values.
+        # During FocusOut that child can be destroyed between the scheduled
+        # callback and ``focus_get()``; Tk then raises KeyError/TclError while
+        # resolving the stale widget path.  Treat that race as loss of focus
+        # and clear motion keys instead of letting the Tk after-loop fail.
+        try:
+            focused = self.root.focus_get()
+        except (KeyError, tk.TclError):
+            focused = None
+        if focused is None:
             self._clear_motion_keys()
             self.keyboard_status_var.set(self._tr("窗口失焦：运动键已清除"))
 
@@ -2263,8 +2301,16 @@ class CR3ControlGUI:
     def start_recording(self) -> None:
         mode = self.mode_var.get()
         teach_recording = mode == "teach" and self.teach_active
-        if (mode != "record" and not teach_recording) or self.real_busy:
-            self.log("只有仿真录制模式，或已验证的示教拖拽模式可以记录轨迹。")
+        live_recording = mode == "live" and self.live_hardware is not None
+        if (
+            mode != "record"
+            and not teach_recording
+            and not live_recording
+        ) or self.real_busy:
+            self.log(
+                "只有仿真录制模式、已验证的示教拖拽模式，"
+                "或活动的实时同步可以记录轨迹。"
+            )
             return
         now = time.monotonic()
         self.recorder.start(
@@ -2273,11 +2319,16 @@ class CR3ControlGUI:
             self.data.xpos[self.end_effector_id],
         )
         self.saved_path = None
-        self.dry_run_passed = False
-        self.armed_until = 0.0
         self._set_button_text(self.record_button, "停止记录  [KP Enter]")
-        self.status_var.set("TEACH RECORDING" if teach_recording else "RECORDING")
-        self.log("示教轨迹记录已开始。" if teach_recording else "轨迹记录已开始。")
+        if live_recording:
+            self.status_var.set("LIVE RECORDING")
+            self.log("实时同步轨迹记录已开始，将随实时同步发送的轨迹采样。")
+        elif teach_recording:
+            self.status_var.set("TEACH RECORDING")
+            self.log("示教轨迹记录已开始。")
+        else:
+            self.status_var.set("RECORDING")
+            self.log("轨迹记录已开始。")
 
     def stop_recording(self) -> None:
         if not self.recorder.recording:
@@ -2288,7 +2339,7 @@ class CR3ControlGUI:
             self.data.qpos[self.arm_qpos_indices],
             self.data.xpos[self.end_effector_id],
         )
-        self.saved_path = self.recorder.save_json(self.args.output_dir.resolve())
+        self.saved_path = None
         self._set_button_text(self.record_button, "开始记录  [KP Enter]")
         self.status_var.set(
             "TEACH TRAJECTORY READY" if self.teach_active else "TRAJECTORY READY"
@@ -2297,88 +2348,142 @@ class CR3ControlGUI:
             f"记录完成：{len(self.recorder.points)} samples，"
             f"{self.recorder.duration:.3f} s"
         )
-        self.log(f"已保存：{self.saved_path}")
+        self.log(
+            "轨迹尚未保存；点击『保存轨迹』可保留，否则会被下一次录制或关闭 GUI 覆盖。"
+        )
 
     def clear_trajectory(self) -> None:
         if self.real_busy:
             return
         self.recorder.clear()
         self.saved_path = None
-        self.dry_run_passed = False
-        self.armed_until = 0.0
-        self.arm_status_var.set("未武装")
+        self.arm_status_var.set("")
         self._set_button_text(self.record_button, "开始记录  [KP Enter]")
         self.status_var.set("SIMULATION READY")
         self.log("轨迹已清空；实体机器人未收到命令。")
 
-    def run_dry_review(self) -> None:
+    @staticmethod
+    def _sanitize_name(name: str) -> str:
+        clean = "".join(
+            ch if ch.isalnum() or ch in "-_" else "_" for ch in name
+        ).strip("_")
+        return clean or "trajectory"
+
+    def save_trajectory(self) -> None:
+        if self.real_busy:
+            return
+        if not self.recorder.review_ready or not self.recorder.points:
+            self.log("没有可保存的轨迹；请先录制或加载一条轨迹。")
+            return
+        default = f"traj{len(self._trajectory_files) + 1}"
+        name = simpledialog.askstring(
+            self._tr("保存轨迹", "Save Trajectory"),
+            self._tr(
+                "输入轨迹名称（同名会覆盖已有轨迹）：",
+                "Enter a trajectory name (same name overwrites the saved file):",
+            ),
+            initialvalue=default,
+            parent=self.root,
+        )
+        if not name or not name.strip():
+            return
+        path = (
+            self.args.output_dir.resolve()
+            / f"{self._sanitize_name(name.strip())}.json"
+        )
+        existed = path.exists()
+        try:
+            self.recorder.save_to(path)
+        except Exception as exc:
+            self.log(f"无法保存轨迹：{exc}")
+            return
+        self.saved_path = path
+        self._refresh_trajectory_list(select=path.stem)
+        if existed:
+            self.log(
+                f"已覆盖同名轨迹：{path.name}"
+                f"（{len(self.recorder.points)} 个采样）"
+            )
+        else:
+            self.log(
+                f"已保存轨迹：{path.name}"
+                f"（{len(self.recorder.points)} 个采样）"
+            )
+        self.log(
+            "可在下方『选择已保存轨迹』下拉框中选中它，"
+            "随时点击『真实回放』多次回放。"
+        )
+
+    def _refresh_trajectory_list(self, select: str | None = None) -> None:
+        output = self.args.output_dir.resolve()
+        self._trajectory_files.clear()
+        if output.is_dir():
+            for path in sorted(output.glob("*.json")):
+                try:
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                if data.get("format") == "cr3_mujoco_joint_trajectory_v1":
+                    self._trajectory_files[path.stem] = path
+        names = sorted(self._trajectory_files)
+        self.trajectory_combo["values"] = names
+        if select and select in self._trajectory_files:
+            self.trajectory_combo_var.set(select)
+        elif not self.trajectory_combo_var.get():
+            self.trajectory_combo_var.set(
+                self._tr("选择已保存轨迹…", "Select saved trajectory…")
+            )
+
+    def load_trajectory(self, _event=None) -> None:
+        name = self.trajectory_combo_var.get()
+        path = self._trajectory_files.get(name)
+        if path is None:
+            return
+        if self.real_busy or self.recorder.recording:
+            self.log("请先停止当前记录或回放，再选择轨迹。")
+            return
+        try:
+            count = self.recorder.load_json(path)
+        except Exception as exc:
+            self.log(f"无法加载轨迹：{exc}")
+            return
+        self.saved_path = path
+        self.arm_status_var.set(self._tr("已加载，可回放", "Loaded, ready to replay"))
+        self.status_var.set("TRAJECTORY LOADED")
+        self.log(
+            f"已加载轨迹：{path.name}（{count} 个采样，"
+            f"{self.recorder.duration:.3f} s）"
+        )
+        self.log("点击『真实回放』或按 KP * 可直接回放该轨迹。")
+
+    def start_real_playback(self) -> None:
+        if self.real_busy or self.estop_latched or self.teach_active:
+            return
+        if not self.args.enable_real_execution:
+            self.log("实机运动锁定：请使用 --enable-real-execution 启动 GUI。")
+            return
+        if self.teach_active or self.teach_starting:
+            self.log("请先退出示教拖拽，再执行真实回放。")
+            return
+        if self.live_hardware is not None:
+            self.log("实时同步正在运行；请先停止实时同步，再执行真实回放。")
+            return
+        if self.mode_var.get() == "quest" or self.quest_receiver is not None:
+            self.log("Quest 仿真正在运行；请先停止 Quest 接收并切换到录制回放模式。")
+            return
         if not self.recorder.review_ready:
-            self.log("没有已停止并可供检查的轨迹。")
+            self.log("没有可回放的轨迹；请先录制或加载一条轨迹。")
             return
         errors = validate_trajectory(
             self.recorder.points, self.model.jnt_range[self.arm_joint_ids]
         )
         if errors:
-            self.dry_run_passed = False
             self.log("轨迹安全检查失败：")
             for error in errors:
                 self.log(f"  - {error}")
             return
-        try:
-            speed, acceleration = self._real_motion_parameters()
-            commands = build_servoj_dry_run(
-                self.recorder.points,
-                sample_period=LIVE_SERVO_PERIOD_S,
-            )
-        except Exception as exc:
-            self.log(f"参数无效：{exc}")
-            return
-        self.dry_run_passed = True
-        self.status_var.set("DRY RUN PASSED")
-        self.log(
-            f"Dry Run 通过：{len(commands)} 个连续 ServoJ 采样，"
-            f"{1 / LIVE_SERVO_PERIOD_S:.1f} Hz，主机限速 "
-            f"{CR3_MAX_JOINT_SPEED_DEG_S * speed / 100.0:.1f}°/s；"
-            f"AccJ={acceleration}% 仅保留，ServoJ 不使用"
-        )
-        for command in commands[:5]:
-            self.log(command)
-        if len(commands) > 5:
-            self.log(f"... 还有 {len(commands) - 5} 个 ServoJ 采样")
-        self.log("尚未连接 30003，尚未发送运动命令。")
-
-    def arm_real_playback(self) -> None:
-        if not self.args.enable_real_execution:
-            self.log("实机运动锁定：请使用 --enable-real-execution 启动 GUI。")
-            return
-        if self.estop_latched:
-            self.log("软件急停已锁存；请在 DobotStudio 清除并重新使能。")
-            return
-        if self.teach_active or self.teach_starting:
-            self.log("请先退出示教拖拽，再武装真实回放。")
-            return
-        if self.mode_var.get() == "quest" or self.quest_receiver is not None:
-            self.log("Quest 仿真正在运行；请先停止 Quest 接收并切换到录制回放模式。")
-            return
-        if not self.dry_run_passed or not self.recorder.review_ready:
-            self.log("请先完成轨迹记录和 Dry Run。")
-            return
         if not MAPPING_CALIBRATED:
             self.log("关节映射未标定，禁止真实回放。")
-            return
-        self.armed_until = time.monotonic() + core.REAL_CONFIRMATION_WINDOW_S
-        self.arm_status_var.set("真实回放已武装：15 秒内点击最终确认")
-        self.status_var.set("REAL PLAYBACK ARMED")
-        self.log("真实回放已武装 15 秒；尚未发送运动命令。")
-
-    def confirm_real_playback(self) -> None:
-        now = time.monotonic()
-        if self.armed_until <= 0.0 or now > self.armed_until:
-            self.armed_until = 0.0
-            self.arm_status_var.set("武装已过期")
-            self.log("真实回放武装已过期，请重新武装。")
-            return
-        if self.real_busy or self.estop_latched or self.teach_active:
             return
         try:
             speed, acceleration = self._real_motion_parameters()
@@ -2389,14 +2494,15 @@ class CR3ControlGUI:
         if robot_ip is None:
             return
         if not messagebox.askyesno(
-            self._tr("最终真实运动确认", "Final Real-Motion Confirmation"),
+            self._tr("真实回放确认", "Real Playback Confirmation"),
             self._tr(
-                "即将控制实体 CR3。\n\n"
+                "即将控制实体 CR3，先移动到轨迹起点，再低速回放。\n\n"
                 f"IP: {robot_ip}\n"
                 f"主机关节限速: {CR3_MAX_JOINT_SPEED_DEG_S * speed / 100.0:.1f} deg/s\n"
                 f"AccJ: {acceleration}%（保留参数，ServoJ 不使用）\n\n"
                 "确认工作区安全并执行吗？",
-                "About to control the physical CR3.\n\n"
+                "About to control the physical CR3: it will first move to the "
+                "trajectory start, then replay slowly.\n\n"
                 f"IP: {robot_ip}\n"
                 f"Host joint speed limit: {CR3_MAX_JOINT_SPEED_DEG_S * speed / 100.0:.1f} deg/s\n"
                 f"AccJ: {acceleration}% (retained only; unused by ServoJ)\n\n"
@@ -2404,15 +2510,14 @@ class CR3ControlGUI:
             ),
             icon="warning",
         ):
-            self.log("用户取消了最终真实回放确认。")
+            self.log("用户取消了真实回放确认。")
             return
 
-        self.armed_until = 0.0
         self.arm_status_var.set("真实回放执行中")
         self.real_busy = True
         self.real_stop_event = threading.Event()
         self.status_var.set("REAL PLAYBACK RUNNING")
-        self.log("最终确认完成，正在连接并执行低速真实回放。")
+        self.log("确认完成，正在连接并执行低速真实回放。")
 
         def work():
             core.execute_real_trajectory(
@@ -2503,10 +2608,6 @@ class CR3ControlGUI:
         raw = self.robot_ip_var.get().strip()
         ip_text_changed = raw != self.last_robot_ip_text
         self.last_robot_ip_text = raw
-        if ip_text_changed and getattr(self, "armed_until", 0.0) > 0.0:
-            self.armed_until = 0.0
-            self.arm_status_var.set(self._tr("未武装", "Not armed"))
-            self.log("目标 IP 已修改；真实回放武装已取消。")
         try:
             selected = self._normalize_robot_ip(raw)
         except ValueError:
@@ -2766,8 +2867,7 @@ class CR3ControlGUI:
             return
         self.dashboard_action_busy = True
         self.real_stop_event.set()
-        self.armed_until = 0.0
-        self.arm_status_var.set("未武装")
+        self.arm_status_var.set("")
         self.live_starting = False
         self.quest_real_stage = "idle"
         self.quest_real_confirm_until = 0.0
@@ -3023,8 +3123,7 @@ class CR3ControlGUI:
         self.disable_in_progress = True
         self.dashboard_action_busy = True
         self.real_stop_event.set()
-        self.armed_until = 0.0
-        self.arm_status_var.set("未武装")
+        self.arm_status_var.set("")
         self.live_starting = False
         self.quest_real_stage = "idle"
         self.quest_real_confirm_until = 0.0
@@ -3072,7 +3171,6 @@ class CR3ControlGUI:
             self.stop_recording()
         self.estop_latched = True
         self.real_stop_event.set()
-        self.armed_until = 0.0
         self.arm_status_var.set("软件急停已锁存")
         self.status_var.set("SOFTWARE EMERGENCY STOP")
         self.log("软件急停触发：本地运动发送已锁定，正在发送 EmergencyStop()。")
@@ -4381,15 +4479,6 @@ class CR3ControlGUI:
         self._update_quest_mocap(now)
         self._check_quest_hand_follower()
         self._check_quest_real_sync(now)
-
-        if self.armed_until > 0.0:
-            remaining = self.armed_until - now
-            if remaining <= 0.0:
-                self.armed_until = 0.0
-                self.arm_status_var.set("武装已过期")
-                self.log("真实回放武装已过期。")
-            else:
-                self.arm_status_var.set(f"真实回放已武装：剩余 {remaining:.1f} 秒")
 
         try:
             if self.live_hardware is not None:

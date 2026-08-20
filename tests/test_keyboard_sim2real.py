@@ -405,7 +405,6 @@ class KeyboardSim2RealTests(unittest.TestCase):
         controller.recorder = Mock(recording=False)
         controller._clear_motion_keys = Mock()
         controller.real_stop_event = Mock()
-        controller.armed_until = 10.0
         controller.arm_status_var = Mock()
         controller.live_starting = True
         controller.quest_real_stage = "active"
@@ -1352,6 +1351,59 @@ class KeyboardSim2RealTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = recorder.save_json(Path(directory))
             self.assertTrue(path.is_file())
+
+    def test_load_json_round_trip(self):
+        recorder = TrajectoryRecorder(sample_period=0.02)
+        q0 = app.HOME_Q_RAD.copy()
+        q1 = q0 + np.deg2rad([0.1, 0, 0, 0, 0, 0])
+        recorder.start(10.0, q0, [0.1, 0.2, 0.3])
+        recorder.sample(10.02, q1, [0.101, 0.2, 0.3])
+        recorder.stop(10.04, q1, [0.101, 0.2, 0.3])
+        with tempfile.TemporaryDirectory() as directory:
+            path = recorder.save_to(Path(directory) / "traj_a.json")
+            loaded = TrajectoryRecorder(sample_period=0.02)
+            count = loaded.load_json(path)
+            self.assertEqual(count, len(recorder.points))
+            self.assertTrue(loaded.review_ready)
+            self.assertFalse(loaded.recording)
+            np.testing.assert_allclose(
+                [p.q for p in loaded.points], [p.q for p in recorder.points]
+            )
+
+    def test_load_json_rejects_wrong_format(self):
+        recorder = TrajectoryRecorder()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "bad.json"
+            path.write_text('{"format": "other", "points": []}', encoding="utf-8")
+            with self.assertRaises(ValueError):
+                recorder.load_json(path)
+
+    def test_save_to_overwrites_same_named_path(self):
+        recorder = TrajectoryRecorder(sample_period=0.02)
+        q0 = app.HOME_Q_RAD.copy()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "same.json"
+            recorder.start(10.0, q0, [0.1, 0.2, 0.3])
+            recorder.stop(
+                10.02, q0 + np.deg2rad([0.2, 0, 0, 0, 0, 0]), [0.1, 0.2, 0.3]
+            )
+            recorder.save_to(path)
+            loaded_first = TrajectoryRecorder()
+            loaded_first.load_json(path)
+            recorder.start(20.0, q0, [0.1, 0.2, 0.3])
+            recorder.stop(
+                20.02, q0 + np.deg2rad([0.5, 0, 0, 0, 0, 0]), [0.1, 0.2, 0.3]
+            )
+            recorder.save_to(path)
+            loaded_second = TrajectoryRecorder()
+            loaded_second.load_json(path)
+            self.assertEqual(
+                loaded_second.points[-1].q[0], q0[0] + np.deg2rad(0.5)
+            )
+            self.assertNotEqual(
+                loaded_first.points[-1].q[0],
+                loaded_second.points[-1].q[0],
+            )
 
     def test_downsample_removes_stationary_duplicate_waypoints(self):
         q0 = np.zeros(6)

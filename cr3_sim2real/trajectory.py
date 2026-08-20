@@ -70,13 +70,8 @@ class TrajectoryRecorder:
     def duration(self) -> float:
         return self.points[-1].time if self.points else 0.0
 
-    def save_json(self, output_dir: Path) -> Path:
-        if not self.points:
-            raise ValueError("Cannot save an empty trajectory")
-        output_dir.mkdir(parents=True, exist_ok=True)
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = output_dir / f"cr3_trajectory_{stamp}.json"
-        payload = {
+    def _payload(self) -> dict:
+        return {
             "format": "cr3_mujoco_joint_trajectory_v1",
             "joint_names": list(JOINT_NAMES),
             "units": {"time": "s", "q": "rad", "tcp": "m"},
@@ -90,8 +85,57 @@ class TrajectoryRecorder:
                 for point in self.points
             ],
         }
-        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    def save_json(self, output_dir: Path) -> Path:
+        if not self.points:
+            raise ValueError("Cannot save an empty trajectory")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = output_dir / f"cr3_trajectory_{stamp}.json"
+        path.write_text(json.dumps(self._payload(), indent=2), encoding="utf-8")
         return path
+
+    def save_to(self, path: Path) -> Path:
+        if not self.points:
+            raise ValueError("Cannot save an empty trajectory")
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(self._payload(), indent=2), encoding="utf-8")
+        return path
+
+    def load_json(self, path: Path) -> int:
+        """Load a saved cr3_mujoco_joint_trajectory_v1 file into this recorder.
+
+        Clears any in-progress recording and marks the trajectory ready for
+        review/playback. Returns the number of loaded points.
+        """
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        if data.get("format") != "cr3_mujoco_joint_trajectory_v1":
+            raise ValueError(f"not a saved CR3 trajectory file: {path.name}")
+        raw_points = data.get("points")
+        if not isinstance(raw_points, list) or not raw_points:
+            raise ValueError("trajectory file is empty")
+        points = []
+        for entry in raw_points:
+            q = np.asarray(entry["q"], dtype=float)
+            tcp = np.asarray(entry["tcp"], dtype=float)
+            if q.shape != (6,):
+                raise ValueError(f"joint data must have shape (6,), got {q.shape}")
+            if tcp.ndim != 1:
+                raise ValueError("TCP samples must be a fixed-size vector")
+            points.append(TrajectoryPoint(time=float(entry["time"]), q=q, tcp=tcp))
+        qs = np.asarray([p.q for p in points], dtype=float)
+        times = np.asarray([p.time for p in points], dtype=float)
+        if not np.isfinite(qs).all() or not np.isfinite(times).all():
+            raise ValueError("trajectory contains NaN or Inf")
+        if len(times) > 1 and np.any(np.diff(times) <= 0.0):
+            raise ValueError("timestamps must increase strictly")
+        self.points = points
+        self.recording = False
+        self.review_ready = True
+        self._started_at = 0.0
+        self._last_sample_time = float("-inf")
+        return len(points)
 
 
 def validate_trajectory(
