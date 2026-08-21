@@ -1467,7 +1467,7 @@ class KeyboardSim2RealTests(unittest.TestCase):
         self.assertTrue(any("NaN" in error for error in errors))
 
         points[1] = TrajectoryPoint(
-            0.1, np.deg2rad([6.0, 0, 0, 0, 0, 0]), np.zeros(3)
+            0.1, np.deg2rad([9.0, 0, 0, 0, 0, 0]), np.zeros(3)
         )
         errors = validate_trajectory(points, np.tile([-10.0, 10.0], (6, 1)))
         self.assertTrue(any("jump" in error for error in errors))

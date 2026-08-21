@@ -142,7 +142,9 @@ def validate_trajectory(
     points: list[TrajectoryPoint],
     joint_ranges_rad: np.ndarray,
     *,
-    max_joint_jump_deg: float = 5.0,
+    # Allow the larger step observed in hand-guided/teaching captures while
+    # still rejecting abrupt multi-degree discontinuities before real replay.
+    max_joint_jump_deg: float = 8.0,
 ) -> list[str]:
     """Return rejection reasons; an empty list means the trajectory passed."""
     errors: list[str] = []

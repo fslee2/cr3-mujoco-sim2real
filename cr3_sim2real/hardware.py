@@ -70,6 +70,8 @@ class RobotFeedback:
     six_force_online: bool = False
     drag_status: bool = False
     joint_modes: np.ndarray | None = None
+    payload_kg: float = 0.0
+    payload_center_mm: np.ndarray | None = None
 
 
 def limit_joint_velocity(
@@ -219,6 +221,15 @@ class FeedbackReceiver:
                                 six_force_online=bool(parsed["six_force_online"][0]),
                                 drag_status=bool(parsed["drag_status"][0]),
                                 joint_modes=parsed["joint_modes"][0].copy(),
+                                payload_kg=float(parsed["load"][0]),
+                                payload_center_mm=np.asarray(
+                                    [
+                                        parsed["center_x"][0],
+                                        parsed["center_y"][0],
+                                        parsed["center_z"][0],
+                                    ],
+                                    dtype=float,
+                                ),
                             )
                             with self._lock:
                                 self._latest = feedback
@@ -366,6 +377,42 @@ def enable_robot(robot_ip: str) -> str:
     try:
         reply = dashboard.EnableRobot()
         require_command_success("EnableRobot", reply)
+        return normalize_reply(reply)
+    finally:
+        dashboard.close()
+
+
+def enable_robot_with_payload(
+    robot_ip: str,
+    load_kg: float,
+    center_x_mm: float,
+    center_y_mm: float,
+    center_z_mm: float,
+) -> str:
+    """Enable CR3 while applying its payload and center-of-mass parameters.
+
+    The CR-series V3 dashboard API accepts the payload as optional arguments
+    to ``EnableRobot``.  Keeping this as a separate guarded operation avoids
+    silently changing the normal no-argument enable path.
+    """
+    values = np.asarray(
+        [load_kg, center_x_mm, center_y_mm, center_z_mm], dtype=float
+    )
+    if not np.isfinite(values).all():
+        raise ValueError("payload values must be finite")
+    if not 0.0 <= float(load_kg) <= 3.0:
+        raise ValueError("CR3 payload must be between 0 and 3 kg")
+    if np.any(np.abs(values[1:]) > 999.0):
+        raise ValueError("payload center coordinates must be within ±999 mm")
+    dashboard = DobotApiDashboard(robot_ip, DASHBOARD_PORT)
+    try:
+        reply = dashboard.EnableRobot(
+            float(load_kg),
+            float(center_x_mm),
+            float(center_y_mm),
+            float(center_z_mm),
+        )
+        require_command_success("EnableRobot(payload)", reply)
         return normalize_reply(reply)
     finally:
         dashboard.close()

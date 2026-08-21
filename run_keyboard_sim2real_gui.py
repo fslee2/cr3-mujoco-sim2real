@@ -31,6 +31,7 @@ from cr3_sim2real.hardware import (
     clear_robot_error,
     continue_robot_queue,
     disable_robot,
+    enable_robot_with_payload,
     emergency_stop_robot,
     enable_robot,
     get_robot_error_ids,
@@ -81,6 +82,7 @@ CRAFT_MEDIAPIPE_SCRIPT = (
     CRAFT_HAND_REPO / "python" / "mediapipe_thumb_opposition_follow.py"
 )
 CRAFT_HAND_PYTHON = CRAFT_HAND_REPO / ".venv" / "Scripts" / "python.exe"
+CRAFT_POSITION_FORMAT = "craft_hand_motor_position_v1"
 QUEST_REAL_HOME_SPEED_DEG_S = 5.0
 MANUAL_REAL_HOME_SPEED_DEG_S = 5.0
 QUEST_REAL_HAND_WATCHDOG_S = 5.0
@@ -173,10 +175,15 @@ UI_TEXT_EN = {
     "MediaPipe 已停止": "MediaPipe stopped",
     "锁定目标": "Lock target",
     "恢复跟随": "Resume follow",
-    "保存位置 1": "Save position 1",
-    "保存位置 2": "Save position 2",
-    "调用位置 1": "Use position 1",
-    "调用位置 2": "Use position 2",
+    "电机掉电 · 手动摆位": "Torque Off · Hand Pose",
+    "恢复电机扭矩": "Restore Motor Torque",
+    "保存当前位置…": "Save Current Position…",
+    "调用已保存位置": "Use Saved Position",
+    "选择已保存手位…": "Select saved hand pose…",
+    "手动摆位步骤：电机掉电 → 摆位 → 保存 → 恢复扭矩 → 调用":
+        "Manual pose: torque off → pose → save → restore torque → use",
+    "输入手位名称（同名会覆盖已有位置）：":
+        "Enter a hand-pose name (same name overwrites the saved position):",
     "灵巧手实机输出（谨慎）": "Live hand output (caution)",
     "摄像头预览未启动": "Camera preview inactive",
     "收起 MediaPipe 子页面": "Close MediaPipe panel",
@@ -219,9 +226,20 @@ UI_TEXT_EN = {
     "同步限速": "Live Limit",
     "全局倍率": "Global Scale",
     "应用实机全局倍率": "Apply Global Scale",
+    "末端负载": "Tool Payload",
+    "重量 (kg)": "Weight (kg)",
+    "重心 X (mm)": "CoG X (mm)",
+    "重心 Y (mm)": "CoG Y (mm)",
+    "重心 Z (mm)": "CoG Z (mm)",
+    "应用负载并使能": "Apply Payload + Enable",
+    "应用负载（需先取消使能）": "Apply Payload (disable first)",
+    "恢复默认负载": "Restore Default Payload",
+    "末端负载未应用": "Tool payload not applied",
     "仿真与轨迹": "Simulation & Trajectory",
     "开始记录  [KP Enter]": "Record  [Enter]",
     "停止记录  [KP Enter]": "Stop  [Enter]",
+    "开始示教记录  [KP Enter]": "Teach record  [Enter]",
+    "停止示教记录  [KP Enter]": "Stop teach record  [Enter]",
     "仿真 Home  [KP 5]": "Home  [KP 5]",
     "清空轨迹  [KP /]": "Clear  [KP /]",
     "真实回放  [KP *]": "Replay  [KP *]",
@@ -1003,7 +1021,11 @@ class CR3ControlGUI:
         self.mediapipe_preview: tk.Label | None = None
         self.mediapipe_start_button: ttk.Button | None = None
         self.mediapipe_lock_button: ttk.Button | None = None
-        self.mediapipe_position_buttons: dict[str, ttk.Button] = {}
+        self.mediapipe_manual_button: ttk.Button | None = None
+        self.mediapipe_manual_mode = False
+        self.craft_position_combo: ttk.Combobox | None = None
+        self.craft_position_combo_var = tk.StringVar()
+        self._craft_position_files: dict[str, Path] = {}
         self.mediapipe_panel_vars: dict[str, tk.Variable] = {}
         self.quest_phase = "idle"
         self.quest_last_sequence = 0
@@ -1050,6 +1072,13 @@ class CR3ControlGUI:
         self.real_speed_var = tk.StringVar(value="10")
         self.real_acc_var = tk.StringVar(value="5")
         self.global_speed_var = tk.StringVar(value="10")
+        self.payload_load_var = tk.StringVar(value="0.0")
+        self.payload_center_x_var = tk.StringVar(value="0.0")
+        self.payload_center_y_var = tk.StringVar(value="0.0")
+        self.payload_center_z_var = tk.StringVar(value="0.0")
+        self.payload_status_var = tk.StringVar(value="末端负载未应用")
+        self.payload_apply_button: ttk.Button | None = None
+        self.payload_reset_button: ttk.Button | None = None
         self.live_speed_var = tk.StringVar(
             value=f"{DEFAULT_LIVE_JOINT_SPEED_DEG_S:g}"
         )
@@ -1087,10 +1116,12 @@ class CR3ControlGUI:
 
         self._build_ui()
         self._refresh_trajectory_list()
+        self._refresh_craft_position_list()
         self.robot_ip_var.trace_add("write", self._on_robot_ip_edited)
         self._bind_events()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.after(UI_PERIOD_MS, self._tick)
+        self._update_record_button_text()
         self.log("自定义 MuJoCo GUI 已启动；当前没有发送实机命令。")
         if not args.enable_real_execution:
             self.log("实机运动锁定：启动时需要 --enable-real-execution。")
@@ -1412,7 +1443,10 @@ class CR3ControlGUI:
         # Controls deliberately get a wider, two-column area.  A single tall
         # column pushed the lower trajectory buttons outside normal laptop
         # windows.  The viewport is the flexible region and yields space first.
-        controls = ttk.Frame(body, width=780)
+        # Give the safety/payload controls a little more room.  The MuJoCo
+        # viewport is the flexible column and will shrink first on smaller
+        # displays, so the right-hand controls remain fully visible.
+        controls = ttk.Frame(body, width=840)
         controls.grid(row=0, column=1, sticky="ns")
         controls.grid_propagate(False)
         controls.columnconfigure(0, weight=1)
@@ -1518,6 +1552,51 @@ class CR3ControlGUI:
             justify=tk.LEFT,
             foreground="#8fbfff",
         ).grid(row=11, column=0, columnspan=3, sticky="nw")
+
+        payload = ttk.LabelFrame(
+            connection,
+            text=self._tr("末端负载", "Tool Payload"),
+            padding=6,
+            style="Card.TLabelframe",
+        )
+        payload.grid(row=12, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+        payload.columnconfigure(1, weight=1)
+        payload.columnconfigure(3, weight=1)
+        payload_fields = (
+            ("重量 (kg)", self.payload_load_var, 0, 0),
+            ("重心 X (mm)", self.payload_center_x_var, 0, 2),
+            ("重心 Y (mm)", self.payload_center_y_var, 1, 0),
+            ("重心 Z (mm)", self.payload_center_z_var, 1, 2),
+        )
+        for label, variable, row, column in payload_fields:
+            ttk.Label(payload, text=self._tr(label)).grid(
+                row=row, column=column, sticky="w", padx=(0, 4), pady=2
+            )
+            ttk.Entry(payload, textvariable=variable, width=8).grid(
+                row=row, column=column + 1, sticky="ew", padx=(0, 6), pady=2
+            )
+        self.payload_apply_button = ttk.Button(
+            payload,
+            text=self._tr("应用负载（需先取消使能）", "Apply Payload (disable first)"),
+            command=self.on_apply_payload,
+        )
+        self.payload_apply_button.grid(
+            row=2, column=0, columnspan=2, sticky="ew", padx=(0, 3), pady=(5, 0)
+        )
+        self.payload_reset_button = ttk.Button(
+            payload,
+            text=self._tr("恢复默认负载", "Restore Default Payload"),
+            command=self.on_reset_payload,
+        )
+        self.payload_reset_button.grid(
+            row=2, column=2, columnspan=2, sticky="ew", padx=(3, 0), pady=(5, 0)
+        )
+        ttk.Label(
+            payload,
+            textvariable=self.payload_status_var,
+            style="Card.TLabel",
+            wraplength=340,
+        ).grid(row=3, column=0, columnspan=4, sticky="w", pady=(4, 0))
 
         mode = ttk.LabelFrame(controls, text="控制模式", padding=10, style="Card.TLabelframe")
         mode.grid(row=0, column=1, sticky="nsew", padx=(4, 0), pady=(0, 7))
@@ -1849,35 +1928,60 @@ class CR3ControlGUI:
             command=lambda: self._queue_mediapipe_command("resume"),
         ).grid(row=2, column=1, sticky="ew", padx=(4, 0), pady=(5, 0))
 
-        for col, slot in enumerate(("1", "2")):
-            ttk.Button(
-                self.mediapipe_panel,
-                text=self._tr(f"保存位置 {slot}", f"Save position {slot}"),
-                command=lambda s=slot: self._queue_mediapipe_command(f"save:{s}"),
-            ).grid(row=3, column=col, sticky="ew", padx=(0 if col == 0 else 4, 4 if col == 0 else 0), pady=(5, 0))
-            self.mediapipe_position_buttons[slot] = ttk.Button(
-                self.mediapipe_panel,
-                text=self._tr(f"调用位置 {slot}", f"Use position {slot}"),
-                command=lambda s=slot: self._queue_mediapipe_command(f"use:{s}"),
-            )
-            self.mediapipe_position_buttons[slot].grid(
-                row=4, column=col, sticky="ew", padx=(0 if col == 0 else 4, 4 if col == 0 else 0), pady=(5, 0)
-            )
+        self.mediapipe_manual_button = ttk.Button(
+            self.mediapipe_panel,
+            text=self._tr("电机掉电 · 手动摆位", "Torque Off · Hand Pose"),
+            command=self.toggle_mediapipe_manual_mode,
+        )
+        self.mediapipe_manual_button.grid(
+            row=3, column=0, sticky="ew", padx=(0, 4), pady=(5, 0)
+        )
+        ttk.Button(
+            self.mediapipe_panel,
+            text=self._tr("保存当前位置…", "Save Current Position…"),
+            command=self.save_mediapipe_position,
+        ).grid(row=3, column=1, sticky="ew", padx=(4, 0), pady=(5, 0))
+
+        self.craft_position_combo = ttk.Combobox(
+            self.mediapipe_panel,
+            state="readonly",
+            textvariable=self.craft_position_combo_var,
+            width=30,
+            style="Trajectory.TCombobox",
+        )
+        self.craft_position_combo.grid(
+            row=4, column=0, sticky="ew", padx=(0, 4), pady=(5, 0)
+        )
+        ttk.Button(
+            self.mediapipe_panel,
+            text=self._tr("调用已保存位置", "Use Saved Position"),
+            command=self.use_mediapipe_position,
+        ).grid(row=4, column=1, sticky="ew", padx=(4, 0), pady=(5, 0))
+
+        ttk.Label(
+            self.mediapipe_panel,
+            text=self._tr(
+                "手动摆位步骤：电机掉电 → 摆位 → 保存 → 恢复扭矩 → 调用",
+                "Manual pose: torque off → pose → save → restore torque → use",
+            ),
+            style="Card.TLabel",
+            wraplength=480,
+        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(6, 0))
         ttk.Label(
             self.mediapipe_panel,
             textvariable=self.mediapipe_status_var,
             style="Card.TLabel",
             wraplength=480,
-        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(6, 0))
         ttk.Button(
             self.mediapipe_panel,
             text=self._tr("收起 MediaPipe 子页面", "Close MediaPipe panel"),
             command=self.open_mediapipe_thumb_panel,
-        ).grid(row=6, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        ).grid(row=7, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         # Keep advanced calibration values available without expanding the
         # main page.  They are intentionally compact and editable in-place.
         advanced = ttk.Frame(self.mediapipe_panel, style="Card.TFrame")
-        advanced.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        advanced.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         advanced.columnconfigure(1, weight=1)
         ttk.Label(advanced, text=self._tr("摄像头编号", "Camera index"), style="Card.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Entry(advanced, textvariable=self.mediapipe_panel_vars["camera"], width=6).grid(row=0, column=1, sticky="e")
@@ -1886,8 +1990,8 @@ class CR3ControlGUI:
         ttk.Label(advanced, text=self._tr("波特率", "Baud"), style="Card.TLabel").grid(row=2, column=0, sticky="w")
         ttk.Entry(advanced, textvariable=self.mediapipe_panel_vars["baud"], width=12).grid(row=2, column=1, sticky="e")
         # Calibration values remain available to the worker with safe
-        # defaults, but the child page stays compact and focused on the two
-        # requested operations: lock and save/use positions 1/2.
+        # defaults, but the child page stays compact and focused on target
+        # locking plus the torque-off/manual-pose position workflow.
         advanced.grid_remove()
 
         self.mediapipe_panel.grid_remove()
@@ -1993,7 +2097,9 @@ class CR3ControlGUI:
             self.teach_status_var,
             self.quest_status_var,
             self.mediapipe_status_var,
+            self.payload_status_var,
             self.trajectory_combo_var,
+            self.craft_position_combo_var,
         )
         for variable in runtime_variables:
             current = variable.get()
@@ -2508,6 +2614,22 @@ class CR3ControlGUI:
         else:
             self.start_recording()
 
+    def _update_record_button_text(self) -> None:
+        """Keep one recording entry point, with a clear teach-mode label."""
+        if not hasattr(self, "record_button"):
+            return
+        if self.recorder.recording:
+            label = (
+                "停止示教记录  [KP Enter]"
+                if self.mode_var.get() == "teach"
+                else "停止记录  [KP Enter]"
+            )
+        elif self.mode_var.get() == "teach":
+            label = "开始示教记录  [KP Enter]"
+        else:
+            label = "开始记录  [KP Enter]"
+        self._set_button_text(self.record_button, label)
+
     def start_recording(self) -> None:
         mode = self.mode_var.get()
         teach_recording = mode == "teach" and self.teach_active
@@ -2529,7 +2651,7 @@ class CR3ControlGUI:
             self.data.xpos[self.end_effector_id],
         )
         self.saved_path = None
-        self._set_button_text(self.record_button, "停止记录  [KP Enter]")
+        self._update_record_button_text()
         if live_recording:
             self.status_var.set("LIVE RECORDING")
             self.log("实时同步轨迹记录已开始，将随实时同步发送的轨迹采样。")
@@ -2550,7 +2672,7 @@ class CR3ControlGUI:
             self.data.xpos[self.end_effector_id],
         )
         self.saved_path = None
-        self._set_button_text(self.record_button, "开始记录  [KP Enter]")
+        self._update_record_button_text()
         self.status_var.set(
             "TEACH TRAJECTORY READY" if self.teach_active else "TRAJECTORY READY"
         )
@@ -2568,7 +2690,7 @@ class CR3ControlGUI:
         self.recorder.clear()
         self.saved_path = None
         self.arm_status_var.set("")
-        self._set_button_text(self.record_button, "开始记录  [KP Enter]")
+        self._update_record_button_text()
         self.status_var.set("SIMULATION READY")
         self.log("轨迹已清空；实体机器人未收到命令。")
 
@@ -2642,6 +2764,69 @@ class CR3ControlGUI:
         elif not self.trajectory_combo_var.get():
             self.trajectory_combo_var.set(
                 self._tr("选择已保存轨迹…", "Select saved trajectory…")
+            )
+
+    def _craft_position_dir(self) -> Path:
+        """Keep named CRAFT poses alongside, but separate from, CR3 trajectories."""
+        return self.args.output_dir.resolve() / "craft_hand_positions"
+
+    @staticmethod
+    def _read_craft_position_file(path: Path) -> tuple[list[int], np.ndarray]:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if data.get("format") != CRAFT_POSITION_FORMAT:
+            raise ValueError("不是可识别的 CRAFT Hand 位置文件")
+        motor_ids = [int(value) for value in data.get("motor_ids", [])]
+        positions = np.asarray(data.get("positions_rad", []), dtype=np.float64).reshape(-1)
+        if not motor_ids or positions.size != len(motor_ids):
+            raise ValueError("电机编号与位置数量不一致")
+        if not np.all(np.isfinite(positions)):
+            raise ValueError("电机位置包含非有限数值")
+        return motor_ids, positions
+
+    @staticmethod
+    def _write_craft_position_file(
+        path: Path,
+        motor_ids,
+        positions,
+    ) -> None:
+        ids = [int(value) for value in motor_ids]
+        values = np.asarray(positions, dtype=np.float64).reshape(-1)
+        if not ids or values.size != len(ids) or not np.all(np.isfinite(values)):
+            raise ValueError("无法保存：编码器未返回完整的有限位置")
+        payload = {
+            "format": CRAFT_POSITION_FORMAT,
+            "name": path.stem,
+            "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "motor_ids": ids,
+            "units": {"position": "rad"},
+            "positions_rad": values.tolist(),
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.tmp")
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(path)
+
+    def _refresh_craft_position_list(self, select: str | None = None) -> None:
+        self._craft_position_files.clear()
+        directory = self._craft_position_dir()
+        if directory.is_dir():
+            for path in sorted(directory.glob("*.json")):
+                try:
+                    self._read_craft_position_file(path)
+                except Exception:
+                    continue
+                self._craft_position_files[path.stem] = path
+        names = sorted(self._craft_position_files)
+        if self.craft_position_combo is not None:
+            self.craft_position_combo["values"] = names
+        if select and select in self._craft_position_files:
+            self.craft_position_combo_var.set(select)
+        elif self.craft_position_combo_var.get() not in self._craft_position_files:
+            self.craft_position_combo_var.set(
+                self._tr("选择已保存手位…", "Select saved hand pose…")
             )
 
     def load_trajectory(self, _event=None) -> None:
@@ -3196,6 +3381,115 @@ class CR3ControlGUI:
         self.dashboard_action_busy = False
         self.status_var.set(f"{command.upper()} FAILED")
         self.log(f"{command} 失败：{exc}")
+
+    def _payload_values(self) -> tuple[float, float, float, float]:
+        try:
+            values = tuple(
+                float(variable.get())
+                for variable in (
+                    self.payload_load_var,
+                    self.payload_center_x_var,
+                    self.payload_center_y_var,
+                    self.payload_center_z_var,
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("负载重量和重心坐标必须是数字") from exc
+        if not np.isfinite(values).all():
+            raise ValueError("负载参数不能是 NaN 或 Inf")
+        load, center_x, center_y, center_z = values
+        if not 0.0 <= load <= 3.0:
+            raise ValueError("CR3 负载重量必须在 0 到 3 kg 之间")
+        if any(abs(value) > 999.0 for value in (center_x, center_y, center_z)):
+            raise ValueError("负载重心坐标必须在 ±999 mm 范围内")
+        return values
+
+    def on_apply_payload(self) -> None:
+        if not self.args.enable_real_execution:
+            self.log("末端负载设置已锁定：请使用 --enable-real-execution 启动 GUI。")
+            return
+        if self.dashboard_action_busy:
+            self.log("另一个机器人状态命令正在执行，请稍候。")
+            return
+        if self.real_busy or self.live_hardware is not None or self.teach_active:
+            self.log("真实运动、实时同步或示教活动时不能修改负载。")
+            return
+        try:
+            load, center_x, center_y, center_z = self._payload_values()
+        except ValueError as exc:
+            messagebox.showerror(
+                self._tr("负载参数无效", "Invalid Payload"), str(exc), parent=self.root
+            )
+            return
+        robot_ip = self._active_robot_ip()
+        if robot_ip is None:
+            return
+        if self.monitor is None:
+            self.log("应用负载前请先连接 30004 只读反馈，以确认机械臂未使能。")
+            return
+        try:
+            current_state = self.monitor.require_fresh(max_age=0.75)
+        except Exception as exc:
+            self.log(f"无法确认负载设置前的机械臂状态：{exc}")
+            return
+        if current_state.enabled or current_state.drag_status or current_state.robot_mode in (6, 7, 8):
+            self.log(
+                "为避免错误重力补偿，应用负载前必须先取消使能并退出示教/运动状态。"
+            )
+            return
+        if not messagebox.askyesno(
+            self._tr("应用末端负载", "Apply Tool Payload"),
+            self._tr(
+                f"将向 {robot_ip}:29999 发送 EnableRobot({load:g},{center_x:g},{center_y:g},{center_z:g})。\n\n"
+                "这会按输入的重量和重心重新应用负载并尝试使能。请确认参数包含夹具、转接板和线缆，且机械臂处于安全状态。\n\n"
+                "如果当前已经使能，控制器可能拒绝该命令；此时请先取消使能后再应用。",
+                f"Send EnableRobot({load:g},{center_x:g},{center_y:g},{center_z:g}) to {robot_ip}:29999.\n\n"
+                "The values must include the tool, adapter, and cable mass. If the robot is already enabled, disable it first if the controller rejects the command.",
+            ),
+            icon="warning",
+        ):
+            return
+        self.dashboard_action_busy = True
+        self.status_var.set("APPLYING TOOL PAYLOAD")
+        self.payload_status_var.set(
+            self._tr("正在应用末端负载…", "Applying tool payload…")
+        )
+        self.log(
+            f"正在应用末端负载：{load:g} kg，重心=({center_x:g},{center_y:g},{center_z:g}) mm。"
+        )
+        self._background(
+            lambda: enable_robot_with_payload(
+                robot_ip, load, center_x, center_y, center_z
+            ),
+            self._payload_applied,
+            self._payload_failed,
+        )
+
+    def on_reset_payload(self) -> None:
+        """Restore zero payload only while the robot is safely disabled."""
+        self.payload_load_var.set("0.0")
+        self.payload_center_x_var.set("0.0")
+        self.payload_center_y_var.set("0.0")
+        self.payload_center_z_var.set("0.0")
+        self.on_apply_payload()
+
+    def _payload_applied(self, reply: str) -> None:
+        self.dashboard_action_busy = False
+        self.status_var.set("TOOL PAYLOAD APPLIED")
+        self.payload_status_var.set(
+            self._tr("末端负载已应用", "Tool payload applied")
+        )
+        self.log(f"末端负载应用成功：{reply.strip()}")
+        if self.monitor is None:
+            self.connect_feedback()
+
+    def _payload_failed(self, exc: Exception) -> None:
+        self.dashboard_action_busy = False
+        self.status_var.set("TOOL PAYLOAD FAILED")
+        self.payload_status_var.set(
+            self._tr("末端负载应用失败", "Tool payload failed")
+        )
+        self.log(f"末端负载应用失败：{exc}")
 
     def on_enable(self) -> None:
         if not self.args.enable_real_execution:
@@ -3979,6 +4273,63 @@ class CR3ControlGUI:
     def toggle_mediapipe_lock(self) -> None:
         self._queue_mediapipe_command("toggle_lock")
 
+    def toggle_mediapipe_manual_mode(self) -> None:
+        """Toggle the real hand between torque-off posing and torque hold."""
+        self._queue_mediapipe_command("manual_toggle")
+
+    def save_mediapipe_position(self) -> None:
+        thread = self.mediapipe_thread
+        if thread is None or not thread.is_alive():
+            self.mediapipe_status_var.set(
+                self._tr("请先启动 MediaPipe", "Start MediaPipe first")
+            )
+            return
+        if not self.mediapipe_manual_mode:
+            message = self._tr(
+                "请先点击“电机掉电 · 手动摆位”，摆好位置后再保存。",
+                "Click Torque Off · Hand Pose first, pose the hand, then save.",
+            )
+            self.mediapipe_status_var.set(message)
+            self.log(message)
+            return
+        default = f"hand_pose{len(self._craft_position_files) + 1}"
+        name = simpledialog.askstring(
+            self._tr("保存当前手位", "Save Current Hand Pose"),
+            self._tr(
+                "输入手位名称（同名会覆盖已有位置）：",
+                "Enter a hand-pose name (same name overwrites the saved position):",
+            ),
+            initialvalue=default,
+            parent=self.root,
+        )
+        if not name or not name.strip():
+            return
+        clean_name = self._sanitize_name(name.strip())
+        if clean_name == "trajectory":
+            clean_name = "hand_pose"
+        path = self._craft_position_dir() / f"{clean_name}.json"
+        self._queue_mediapipe_command(f"save_path:{path.resolve()}")
+
+    def use_mediapipe_position(self) -> None:
+        name = self.craft_position_combo_var.get()
+        path = self._craft_position_files.get(name)
+        if path is None:
+            message = self._tr(
+                "请先在下拉框中选择已保存手位。",
+                "Select a saved hand pose from the list first.",
+            )
+            self.mediapipe_status_var.set(message)
+            return
+        if self.mediapipe_manual_mode:
+            message = self._tr(
+                "请先恢复电机扭矩，再调用已保存位置。",
+                "Restore motor torque before using a saved position.",
+            )
+            self.mediapipe_status_var.set(message)
+            self.log(message)
+            return
+        self._queue_mediapipe_command(f"use_path:{path.resolve()}")
+
     def _mediapipe_float(self, name: str, low: float, high: float) -> float:
         variable = self.mediapipe_panel_vars[name]
         try:
@@ -4039,6 +4390,7 @@ class CR3ControlGUI:
             return
 
         self.mediapipe_stop_event.clear()
+        self.mediapipe_manual_mode = False
         while True:
             try:
                 self.mediapipe_command_queue.get_nowait()
@@ -4098,7 +4450,6 @@ class CR3ControlGUI:
             args.positions_path = thumb.DEFAULT_POSITIONS
             args.anchors = thumb.DEFAULT_ANCHORS
             anchors = thumb.load_hardware_anchors(args.anchors)
-            saved_positions = thumb.load_saved_positions(args.positions_path)
             args.port = settings["motor_port"] or anchors.get("port_at_capture") or "COM11"
             args.baud = settings["baud"] or int(anchors.get("baud_at_capture", 57600))
             if settings["live"]:
@@ -4127,9 +4478,9 @@ class CR3ControlGUI:
             smoothed_strength = 0.0
             selected_target = None
             motor_position_locked = False
-            active_position_slot = None
+            active_position_name = None
             manual_position_mode = False
-            last_manual_toggle = 0.0
+            saved_position_count = len(self._craft_position_files)
             latest_distances = {name: 99.0 for name in thumb.TARGET_TIPS}
             latest_alphas = {key: 0.0 for key in direct.ACTIVE_CHANNELS}
             if hardware is not None:
@@ -4137,50 +4488,85 @@ class CR3ControlGUI:
 
             with hands_context as hands:
                 while not self.mediapipe_stop_event.is_set():
-                    # GUI buttons are translated into the same state machine as
-                    # the original s/1/2/Space/m keyboard controls.
+                    # Keep the original script's critical safety state machine:
+                    # torque off first, manually pose, read real encoders, then
+                    # restore torque before moving to a named saved target.
                     while True:
                         try:
                             command = self.mediapipe_command_queue.get_nowait()
                         except queue.Empty:
                             break
-                        if command == "toggle_lock":
-                            if not manual_position_mode:
-                                motor_position_locked = not motor_position_locked
-                                active_position_slot = None if not motor_position_locked else active_position_slot
-                                if hardware is not None:
-                                    hardware.set_position_locked(motor_position_locked)
+                        try:
+                            if command == "manual_toggle":
+                                if hardware is None:
+                                    self.ui_events.put((self._handle_mediapipe_worker_event, "预览模式不能操作电机；请勾选灵巧手实机输出并重新启动"))
+                                elif not manual_position_mode:
+                                    hardware.set_manual_mode(True)
+                                    manual_position_mode = True
+                                    motor_position_locked = True
+                                    active_position_name = None
+                                    self.ui_events.put((self._handle_mediapipe_worker_event, "__CRAFT_MANUAL_ON__"))
+                                else:
+                                    # set_manual_mode(False) first captures the
+                                    # current encoder pose and enables torque at
+                                    # that exact target, preventing a jump.
+                                    hardware.set_manual_mode(False)
+                                    manual_position_mode = False
+                                    motor_position_locked = True
+                                    active_position_name = "manual"
+                                    self.ui_events.put((self._handle_mediapipe_worker_event, "__CRAFT_MANUAL_OFF__"))
+                            elif command == "toggle_lock":
+                                if manual_position_mode:
+                                    self.ui_events.put((self._handle_mediapipe_worker_event, "电机已掉电；请先恢复电机扭矩"))
+                                else:
+                                    motor_position_locked = not motor_position_locked
                                     if not motor_position_locked:
+                                        active_position_name = None
+                                    if hardware is not None:
+                                        hardware.set_position_locked(motor_position_locked)
+                                        if not motor_position_locked:
+                                            hardware.set_target_motor_positions(None)
+                                    self.ui_events.put((self._handle_mediapipe_worker_event, "锁定目标" if motor_position_locked else "已恢复跟随"))
+                            elif command == "resume":
+                                if manual_position_mode:
+                                    self.ui_events.put((self._handle_mediapipe_worker_event, "电机已掉电；请先恢复电机扭矩"))
+                                else:
+                                    motor_position_locked = False
+                                    active_position_name = None
+                                    if hardware is not None:
+                                        hardware.release_manual_hold()
                                         hardware.set_target_motor_positions(None)
-                                self.ui_events.put((self._handle_mediapipe_worker_event, "锁定目标" if motor_position_locked else "已恢复跟随"))
-                        elif command == "resume":
-                            motor_position_locked = False
-                            active_position_slot = None
-                            if hardware is not None:
-                                hardware.set_position_locked(False)
-                                hardware.set_target_motor_positions(None)
-                            self.ui_events.put((self._handle_mediapipe_worker_event, "已恢复跟随"))
-                        elif command.startswith("save:"):
-                            slot = command.split(":", 1)[1]
-                            if hardware is None:
-                                self.ui_events.put((self._handle_mediapipe_worker_event, "预览模式不能读取电机位置；请勾选实机输出"))
-                            else:
-                                saved_positions[slot] = hardware.read_motor_positions() if manual_position_mode else hardware.get_last_commanded_target()
-                                thumb.save_saved_positions(args.positions_path, saved_positions)
-                                self.ui_events.put((self._handle_mediapipe_worker_event, f"位置 {slot} 已保存到 {args.positions_path.name}"))
-                        elif command.startswith("use:"):
-                            slot = command.split(":", 1)[1]
-                            if manual_position_mode:
-                                self.ui_events.put((self._handle_mediapipe_worker_event, "请先恢复扭矩，再调用保存位置"))
-                            elif slot not in saved_positions:
-                                self.ui_events.put((self._handle_mediapipe_worker_event, f"位置 {slot} 尚未保存"))
-                            else:
-                                motor_position_locked = True
-                                active_position_slot = slot
-                                if hardware is not None:
-                                    hardware.set_target_motor_positions(saved_positions[slot])
+                                    self.ui_events.put((self._handle_mediapipe_worker_event, "已恢复跟随"))
+                            elif command.startswith("save_path:"):
+                                path = Path(command.split(":", 1)[1])
+                                if hardware is None:
+                                    self.ui_events.put((self._handle_mediapipe_worker_event, "预览模式不能读取电机编码器；请勾选灵巧手实机输出并重新启动"))
+                                elif not manual_position_mode:
+                                    self.ui_events.put((self._handle_mediapipe_worker_event, "拒绝保存：必须先让电机掉电并手动摆位"))
+                                else:
+                                    positions = hardware.read_motor_positions()
+                                    if positions.size != len(direct.MOTOR_IDS) or not np.all(np.isfinite(positions)):
+                                        raise RuntimeError("编码器未返回完整的 15 电机位置")
+                                    self._write_craft_position_file(path, direct.MOTOR_IDS, positions)
+                                    saved_position_count = len(list(path.parent.glob("*.json")))
+                                    self.ui_events.put((self._handle_mediapipe_worker_event, f"__CRAFT_SAVED__|{path}"))
+                            elif command.startswith("use_path:"):
+                                path = Path(command.split(":", 1)[1])
+                                if hardware is None:
+                                    self.ui_events.put((self._handle_mediapipe_worker_event, "预览模式不能调用实机手位；请勾选灵巧手实机输出并重新启动"))
+                                elif manual_position_mode:
+                                    self.ui_events.put((self._handle_mediapipe_worker_event, "请先恢复电机扭矩，再调用已保存位置"))
+                                else:
+                                    motor_ids, positions = self._read_craft_position_file(path)
+                                    if motor_ids != list(direct.MOTOR_IDS):
+                                        raise ValueError("手位文件的电机编号与当前 CRAFT Hand 不一致")
+                                    motor_position_locked = True
+                                    active_position_name = path.stem
+                                    hardware.set_target_motor_positions(positions)
                                     hardware.set_position_locked(True)
-                                self.ui_events.put((self._handle_mediapipe_worker_event, f"已调用位置 {slot}"))
+                                    self.ui_events.put((self._handle_mediapipe_worker_event, f"__CRAFT_USED__|{path.stem}"))
+                        except Exception as command_exc:
+                            self.ui_events.put((self._handle_mediapipe_worker_event, f"CRAFT 位置操作失败：{command_exc}"))
 
                     ok, frame = cap.read()
                     if not ok:
@@ -4219,11 +4605,11 @@ class CR3ControlGUI:
                             hardware.set_target_motor_overrides(dict(zip(thumb.THUMB_MOTOR_IDS, smoothed_thumb)))
                     short_target = "none" if selected_target is None else selected_target.replace("thumb_to_", "")
                     status = [
-                        "GUI: lock/resume | Save 1/2 | Use 1/2",
+                        "GUI: torque-off | named save/use | lock/resume",
                         f"hand={'seen' if hand_seen else 'lost-hold'} target={short_target}",
                         f"strength={smoothed_strength:.2f} max={args.max_opposition:.2f}",
-                        "motor=MANUAL" if manual_position_mode else f"motor=LOCKED ({active_position_slot or 'last'})" if motor_position_locked else "motor=FOLLOW",
-                        f"saved=1:{'yes' if '1' in saved_positions else 'no'} 2:{'yes' if '2' in saved_positions else 'no'}",
+                        "motor=TORQUE-OFF/MANUAL" if manual_position_mode else f"motor=LOCKED ({active_position_name or 'last'})" if motor_position_locked else "motor=FOLLOW",
+                        f"named positions={saved_position_count}",
                         f"hardware={'LIVE' if hardware is not None else 'OFF'}",
                     ]
                     direct.draw_status(cv2, frame, status)
@@ -4239,15 +4625,87 @@ class CR3ControlGUI:
                 hardware.close()
 
     def _handle_mediapipe_worker_event(self, message: str) -> None:
-        self.mediapipe_status_var.set(message)
+        if message == "__CRAFT_MANUAL_ON__":
+            self.mediapipe_manual_mode = True
+            self._set_button_text(self.mediapipe_manual_button, "恢复电机扭矩")
+            display = self._tr(
+                "CRAFT Hand 电机已掉电；请手动摆位，然后点击“保存当前位置”。",
+                "CRAFT Hand torque is off. Pose it manually, then click Save Current Position.",
+            )
+            self.mediapipe_status_var.set(display)
+            self.log(display)
+            return
+        if message == "__CRAFT_MANUAL_OFF__":
+            self.mediapipe_manual_mode = False
+            self._set_button_text(self.mediapipe_manual_button, "电机掉电 · 手动摆位")
+            display = self._tr(
+                "CRAFT Hand 电机扭矩已恢复；当前编码器位置已锁定，可调用手位或恢复跟随。",
+                "CRAFT Hand torque restored at the current encoder pose; use a saved pose or resume following.",
+            )
+            self.mediapipe_status_var.set(display)
+            self.log(display)
+            return
+        if message.startswith("__CRAFT_SAVED__|"):
+            path = Path(message.split("|", 1)[1])
+            self._refresh_craft_position_list(select=path.stem)
+            display = self._tr(
+                f"已从真实编码器保存 CRAFT Hand 位置：{path.name}",
+                f"Saved CRAFT Hand pose from real encoders: {path.name}",
+            )
+            self.mediapipe_status_var.set(display)
+            self.log(display)
+            return
+        if message.startswith("__CRAFT_USED__|"):
+            name = message.split("|", 1)[1]
+            display = self._tr(
+                f"已调用 CRAFT Hand 位置：{name}",
+                f"Using CRAFT Hand pose: {name}",
+            )
+            self.mediapipe_status_var.set(display)
+            self.log(display)
+            return
+        if message == "MediaPipe 已停止" or message.startswith("MediaPipe 错误："):
+            self.mediapipe_manual_mode = False
+
+        worker_english = {
+            "锁定目标": "Target locked",
+            "已恢复跟随": "Following resumed",
+            "恢复跟随": "Resume follow",
+            "预览模式不能操作电机；请勾选灵巧手实机输出并重新启动":
+                "Preview mode cannot operate motors. Enable live hand output and restart MediaPipe.",
+            "预览模式不能读取电机编码器；请勾选灵巧手实机输出并重新启动":
+                "Preview mode cannot read motor encoders. Enable live hand output and restart MediaPipe.",
+            "预览模式不能调用实机手位；请勾选灵巧手实机输出并重新启动":
+                "Preview mode cannot command a saved hardware pose. Enable live hand output and restart MediaPipe.",
+            "电机已掉电；请先恢复电机扭矩":
+                "Motor torque is off. Restore motor torque first.",
+            "拒绝保存：必须先让电机掉电并手动摆位":
+                "Save rejected: torque must be off and the hand must be posed manually first.",
+            "请先恢复电机扭矩，再调用已保存位置":
+                "Restore motor torque before using a saved position.",
+            "MediaPipe 已停止": "MediaPipe stopped",
+        }
+        if message.startswith("CRAFT 位置操作失败："):
+            display = self._tr(
+                message,
+                "CRAFT position operation failed: " + message.split("：", 1)[1],
+            )
+        elif message.startswith("MediaPipe 错误："):
+            display = self._tr(
+                message,
+                "MediaPipe error: " + message.split("：", 1)[1],
+            )
+        else:
+            display = self._tr(message, worker_english.get(message, message))
+        self.mediapipe_status_var.set(display)
         if message == "锁定目标":
             self._set_button_text(self.mediapipe_lock_button, "恢复跟随")
         elif message == "已恢复跟随" or message == "恢复跟随":
             self._set_button_text(self.mediapipe_lock_button, "锁定目标")
-        if message.startswith("MediaPipe 错误"):
-            self.log(message)
+        if message.startswith("MediaPipe 错误") or "失败" in message or "拒绝" in message:
+            self.log(display)
         elif "已保存" in message or "已调用" in message or "锁定" in message or "跟随" in message:
-            self.log(message)
+            self.log(display)
 
     def _refresh_mediapipe_frame(self) -> None:
         preview = self.mediapipe_preview
@@ -4273,6 +4731,8 @@ class CR3ControlGUI:
             return
         self.mediapipe_thread = None
         self._set_button_text(self.mediapipe_start_button, "启动 MediaPipe")
+        self.mediapipe_manual_mode = False
+        self._set_button_text(self.mediapipe_manual_button, "电机掉电 · 手动摆位")
         if self.mediapipe_status_var.get() == "正在启动 MediaPipe…":
             self.mediapipe_status_var.set("MediaPipe 已停止")
 
@@ -4280,6 +4740,7 @@ class CR3ControlGUI:
         thread = self.mediapipe_thread
         if thread is None:
             self._set_button_text(self.mediapipe_start_button, "启动 MediaPipe")
+            self.mediapipe_manual_mode = False
             return
         self.mediapipe_stop_event.set()
         if thread is not threading.current_thread():
@@ -4287,6 +4748,8 @@ class CR3ControlGUI:
         self.mediapipe_thread = None
         self._set_button_text(self.mediapipe_start_button, "启动 MediaPipe")
         self._set_button_text(self.mediapipe_lock_button, "锁定目标")
+        self.mediapipe_manual_mode = False
+        self._set_button_text(self.mediapipe_manual_button, "电机掉电 · 手动摆位")
         self.mediapipe_status_var.set("MediaPipe 已停止")
         self.log("MediaPipe 拇指控制已停止。")
 
@@ -5107,6 +5570,12 @@ class CR3ControlGUI:
             self.keyboard_status_var.set(
                 self._tr("键盘待命：W/S=Z  A/D=Y  Q/E=X  I/K=RX  J/L=RY  U/O=RZ")
             )
+        self._update_record_button_text()
+        if selected == "teach":
+            self.log(
+                "示教流程：进入示教拖拽后，点击轨迹区的『开始示教记录』；"
+                "停止后点击『保存轨迹』，之后仍在同一个轨迹下拉框和『真实回放』中使用。"
+            )
 
     def toggle_teach(self) -> None:
         if self.dashboard_action_busy or self.teach_starting:
@@ -5199,6 +5668,7 @@ class CR3ControlGUI:
             f"示教拖拽已验证 · Mode={state.robot_mode} · Drag={int(state.drag_status)}"
         )
         self.status_var.set("TEACH MODE ACTIVE")
+        self._update_record_button_text()
         self.log(f"StartDrag 已接受：{reply.strip()}")
         self.log("请直接拖动实体机械臂；MuJoCo 将通过 30004 镜像当前姿态。")
 
@@ -5208,6 +5678,7 @@ class CR3ControlGUI:
         self.teach_active = False
         self.mode_var.set("record")
         self._set_button_text(self.teach_button, "进入示教拖拽")
+        self._update_record_button_text()
         self.teach_status_var.set("示教拖拽未启动")
         self.status_var.set("TEACH MODE FAILED")
         self.log(f"StartDrag 失败：{exc}")
@@ -5248,6 +5719,7 @@ class CR3ControlGUI:
         self.teach_starting = False
         self.mode_var.set("record")
         self._set_button_text(self.teach_button, "进入示教拖拽")
+        self._update_record_button_text()
         self.teach_status_var.set(
             f"示教拖拽已退出 · Mode={state.robot_mode} · Drag={int(state.drag_status)}"
         )
@@ -5260,6 +5732,7 @@ class CR3ControlGUI:
         self.teach_active = True
         self.mode_var.set("teach")
         self._set_button_text(self.teach_button, "重试退出示教")
+        self._update_record_button_text()
         self.teach_status_var.set("StopDrag 失败 · 仍按示教活动处理")
         self.status_var.set("STOP DRAG FAILED")
         self.log(f"StopDrag 失败：{exc}；请勿假定机械臂已经退出拖拽状态。")
@@ -5607,6 +6080,16 @@ class CR3ControlGUI:
             + f"{temperature_text}  "
             f"DI 0x{state.digital_input_bits:016X}  DO 0x{state.digital_output_bits:016X}"
         )
+        payload_center = getattr(state, "payload_center_mm", None)
+        if payload_center is not None and np.asarray(payload_center).shape == (3,):
+            center = np.asarray(payload_center, dtype=float)
+            self.io_feedback_var.set(
+                self.io_feedback_var.get()
+                + self._tr("  负载 ", "  Payload ")
+                + f"{float(getattr(state, 'payload_kg', 0.0)):.3f} kg"
+                + self._tr(" 重心 ", " CoG ")
+                + f"({center[0]:+.1f},{center[1]:+.1f},{center[2]:+.1f}) mm"
+            )
         torques = state.joint_torques
         currents = state.joint_currents
         if torques is None or currents is None:
