@@ -95,7 +95,7 @@ class CraftHandDriver:
 
     MOTOR_IDS = list(range(1, 16))
 
-    def __init__(self, port="COM12", baud=57600, current_ma=350):
+    def __init__(self, port="COM11", baud=57600, current_ma=350):
         from pathlib import Path
 
         try:
